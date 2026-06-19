@@ -6,6 +6,8 @@ import { installDiscoveryEndpoints } from "./discovery";
 import { createHttpProxyHandler } from "./httpProxy";
 import { createPaymentMiddleware } from "./payment";
 import { buildRoutes, type BuildEndpointRouteInput } from "./routeBuilder";
+import { endpointToResource, X402ResourceRuntime } from "./resourceRuntime";
+import { InMemoryX402ResourceStore } from "./resourceStore";
 import {
   isHttpEndpoint,
   isWebSocketEndpoint,
@@ -204,21 +206,50 @@ function installWebSocketLeaseEndpoints(
 export function createX402ProxySdk(config: X402ProxySdkConfig): X402ProxySdk {
   validateProxySdkConfig(config);
 
-  const resolvedEndpoints = config.endpoints.map((endpoint) => resolveEndpointDefaults(endpoint, config));
+  const configuredEndpoints = config.endpoints ?? [];
+  const resolvedEndpoints = configuredEndpoints.map((endpoint) => resolveEndpointDefaults(endpoint, config));
   const routeInputs = buildRouteInputs(config, resolvedEndpoints);
   const routes = buildRoutes(routeInputs);
 
   const server = createResourceServer(config.facilitator?.url, config.facilitator?.authorizationBearer);
   const paymentMiddleware = createPaymentMiddleware(routes, server, config.syncFacilitatorOnStart ?? true);
+  const staticResources = configuredEndpoints.map((endpoint) =>
+    endpointToResource(endpoint, { network: config.defaultNetwork, payTo: config.defaultPayTo }),
+  );
+  const resourceStore = config.resourceStore ?? new InMemoryX402ResourceStore(staticResources);
+  const runtimeInput: ConstructorParameters<typeof X402ResourceRuntime>[0] = {
+    store: resourceStore,
+    resourceServer: server,
+    leaseTokenSecret: config.leaseTokenSecret,
+    syncFacilitatorOnStart: config.syncFacilitatorOnStart ?? true,
+    requireProtectedResources: config.requireProtectedResources ?? true,
+  };
+  if (config.security) {
+    runtimeInput.security = config.security;
+  }
+  if (config.discovery) {
+    runtimeInput.discovery = config.discovery;
+  }
+  if (config.facilitator?.url) {
+    runtimeInput.facilitatorUrl = config.facilitator.url;
+  }
+  if (config.accessEventStore) {
+    runtimeInput.accessEventStore = config.accessEventStore;
+  }
+  if (!config.resourceStore) {
+    runtimeInput.initialResources = staticResources;
+  }
+  const resourceRuntime = new X402ResourceRuntime(runtimeInput);
 
   return {
     routes,
     paymentMiddleware,
+    refreshResources: () => resourceRuntime.refreshResources(),
+    listLoadedResources: () => resourceRuntime.listLoadedResources(),
+    diagnostics: () => resourceRuntime.diagnostics(),
     install(app: Express): void {
-      app.use(paymentMiddleware);
-      installDiscoveryEndpoints(app, config.discovery, config.endpoints);
-      installHttpEndpoints(app, resolvedEndpoints, config);
-      installWebSocketLeaseEndpoints(app, resolvedEndpoints, config);
+      installDiscoveryEndpoints(app, config.discovery, configuredEndpoints, resourceRuntime);
+      resourceRuntime.install(app);
     },
   };
 }

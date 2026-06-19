@@ -44,7 +44,7 @@ describe("validateProxySdkConfig", () => {
 
   it("rejects duplicate HTTP route keys", () => {
     const config = createValidConfig();
-    config.endpoints.push({
+    config.endpoints?.push({
       kind: "http",
       id: "prices-2",
       method: "GET",
@@ -63,7 +63,7 @@ describe("validateProxySdkConfig", () => {
 
   it("rejects websocket endpoint with non-positive leaseSeconds", () => {
     const config = createValidConfig();
-    const wsEndpoint = config.endpoints.find((endpoint) => endpoint.kind === "websocket");
+    const wsEndpoint = config.endpoints?.find((endpoint) => endpoint.kind === "websocket");
     if (!wsEndpoint || wsEndpoint.kind !== "websocket") {
       throw new Error("Missing websocket endpoint in test fixture");
     }

@@ -1,6 +1,6 @@
 import type { Express, RequestHandler } from "express";
 
-import type { DiscoveryConfig, ProxyEndpointConfig } from "./types";
+import type { DiscoveryConfig, ProxyEndpointConfig, X402LoadedResource } from "./types";
 import { isHttpEndpoint, isWebSocketEndpoint } from "./types";
 
 export type DiscoveryDocument = {
@@ -46,12 +46,40 @@ export function createDiscoveryDocument(
   return document;
 }
 
+export function createDiscoveryDocumentFromResources(
+  discovery: DiscoveryConfig,
+  resources: X402LoadedResource[],
+): DiscoveryDocument {
+  const urls = new Set<string>();
+  for (const resource of resources) {
+    urls.add(toPublicResourceUrl(discovery.publicBaseUrl, resource.paymentPath));
+  }
+
+  const document: DiscoveryDocument = {
+    version: 1,
+    resources: Array.from(urls).sort(),
+  };
+  if (discovery.ownershipProofs) {
+    document.ownershipProofs = discovery.ownershipProofs;
+  }
+  if (discovery.instructions) {
+    document.instructions = discovery.instructions;
+  }
+  return document;
+}
+
 /**
  * Create a request handler for both x402 discovery routes.
  */
-export function createDiscoveryHandler(discovery: DiscoveryConfig, endpoints: ProxyEndpointConfig[]): RequestHandler {
-  const payload = createDiscoveryDocument(discovery, endpoints);
+export function createDiscoveryHandler(
+  discovery: DiscoveryConfig,
+  endpoints: ProxyEndpointConfig[],
+  runtime?: { listLoadedResources: () => X402LoadedResource[] },
+): RequestHandler {
   return (_req, res) => {
+    const payload = runtime
+      ? createDiscoveryDocumentFromResources(discovery, runtime.listLoadedResources())
+      : createDiscoveryDocument(discovery, endpoints);
     res.status(200).json(payload);
   };
 }
@@ -63,12 +91,13 @@ export function installDiscoveryEndpoints(
   app: Express,
   discovery: DiscoveryConfig | undefined,
   endpoints: ProxyEndpointConfig[],
+  runtime?: { listLoadedResources: () => X402LoadedResource[] },
 ): void {
   if (!discovery?.enabled) {
     return;
   }
 
-  const handler = createDiscoveryHandler(discovery, endpoints);
+  const handler = createDiscoveryHandler(discovery, endpoints, runtime);
   app.get("/.well-known/x402", handler);
   app.get("/x402-discovery.json", handler);
 }
