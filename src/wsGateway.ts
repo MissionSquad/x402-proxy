@@ -1,4 +1,6 @@
 import { LeaseTokenError } from "./errors";
+import { createAccessEvent } from "./resourceStore";
+import type { X402AccessEventStore, X402Resource } from "./types";
 import { verifyLeaseToken } from "./wsLease";
 
 /**
@@ -36,6 +38,7 @@ export type WebSocketGatewayConfig = {
   leaseTokenSecret: string;
   endpoints: WebSocketGatewayEndpoint[];
   allowTokenReuse?: boolean;
+  accessEventStore?: X402AccessEventStore;
 };
 
 const CLOSE_POLICY_VIOLATION = 1008;
@@ -69,6 +72,16 @@ export function installWebSocketGateway(
       const token = query.get("t");
       if (!token) {
         clientConn.close(CLOSE_POLICY_VIOLATION, "missing lease token");
+        await config.accessEventStore?.record(
+          createAccessEvent({
+            resourceId: endpoint.id,
+            kind: "lease_rejected",
+            requestMethod: "GET",
+            requestPath: endpoint.wsPath,
+            statusCode: 1008,
+            errorCode: "missing_lease_token",
+          }),
+        );
         return;
       }
 
@@ -78,6 +91,16 @@ export function installWebSocketGateway(
       } catch (error: unknown) {
         const reason = error instanceof LeaseTokenError ? error.message : "invalid lease token";
         clientConn.close(CLOSE_POLICY_VIOLATION, reason);
+        await config.accessEventStore?.record(
+          createAccessEvent({
+            resourceId: endpoint.id,
+            kind: "lease_rejected",
+            requestMethod: "GET",
+            requestPath: endpoint.wsPath,
+            statusCode: 1008,
+            errorCode: reason,
+          }),
+        );
         return;
       }
 
@@ -85,6 +108,16 @@ export function installWebSocketGateway(
       if (!config.allowTokenReuse) {
         if (consumedTokens.has(payload.jti)) {
           clientConn.close(CLOSE_POLICY_VIOLATION, "lease token already used");
+          await config.accessEventStore?.record(
+            createAccessEvent({
+              resourceId: endpoint.id,
+              kind: "lease_rejected",
+              requestMethod: "GET",
+              requestPath: endpoint.wsPath,
+              statusCode: 1008,
+              errorCode: "lease token already used",
+            }),
+          );
           return;
         }
         consumedTokens.set(payload.jti, payload.exp);
@@ -92,6 +125,16 @@ export function installWebSocketGateway(
 
       if (payload.endpointId !== endpoint.id || payload.upstreamWsUrl !== endpoint.upstreamWsUrl) {
         clientConn.close(CLOSE_POLICY_VIOLATION, "lease token endpoint mismatch");
+        await config.accessEventStore?.record(
+          createAccessEvent({
+            resourceId: endpoint.id,
+            kind: "lease_rejected",
+            requestMethod: "GET",
+            requestPath: endpoint.wsPath,
+            statusCode: 1008,
+            errorCode: "lease token endpoint mismatch",
+          }),
+        );
         return;
       }
 
@@ -126,4 +169,14 @@ export function installWebSocketGateway(
       upstream.onClose(() => closeBoth());
     });
   }
+}
+
+export function webSocketGatewayEndpointsFromResources(resources: X402Resource[]): WebSocketGatewayEndpoint[] {
+  return resources
+    .filter((resource) => resource.enabled && resource.kind === "websocket")
+    .map((resource) => ({
+      id: resource.id,
+      wsPath: resource.publicPath,
+      upstreamWsUrl: resource.upstreamUrl,
+    }));
 }

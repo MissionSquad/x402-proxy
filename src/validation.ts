@@ -145,8 +145,9 @@ export function validateProxySdkConfig(config: X402ProxySdkConfig): void {
     errors.push("leaseTokenSecret must be at least 32 characters");
   }
 
-  if (!Array.isArray(config.endpoints) || config.endpoints.length === 0) {
-    errors.push("endpoints must contain at least one endpoint");
+  const endpoints = config.endpoints ?? [];
+  if (!config.resourceStore && endpoints.length === 0) {
+    errors.push("endpoints must contain at least one endpoint when resourceStore is not provided");
   }
 
   if (!isValidNetwork(config.defaultNetwork)) {
@@ -161,7 +162,7 @@ export function validateProxySdkConfig(config: X402ProxySdkConfig): void {
   const seenHttpRoutes = new Set<string>();
   const seenLeasePaths = new Set<string>();
   const seenWsPaths = new Set<string>();
-  for (const endpoint of config.endpoints) {
+  for (const endpoint of endpoints) {
     if (seenIds.has(endpoint.id)) {
       errors.push(`duplicate endpoint id ${endpoint.id}`);
     } else {

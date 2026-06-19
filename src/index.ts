@@ -9,8 +9,20 @@ export type {
   ProxyEndpointConfig,
   SecurityConfig,
   WebSocketProxyEndpointConfig,
+  X402AccessEvent,
+  X402AccessEventStore,
+  X402AccessMode,
+  X402HeaderPolicy,
+  X402HeaderPreset,
+  X402LoadedResource,
+  X402ProxyDiagnostics,
   X402ProxySdk,
   X402ProxySdkConfig,
+  X402Resource,
+  X402ResourceKind,
+  X402ResourceRefreshResult,
+  X402ResourceStore,
+  X402ResourceValidationIssue,
 } from "./types";
 export { isHttpEndpoint, isWebSocketEndpoint } from "./types";
 export {
@@ -33,4 +45,36 @@ export {
   type WebSocketGatewayConfig,
   type WebSocketGatewayEndpoint,
   type WebSocketServerAdapter,
+  webSocketGatewayEndpointsFromResources,
 } from "./wsGateway";
+export {
+  applyUpstreamResponseHeaders,
+  createForwardHeaders,
+  shouldDropProxyHeader,
+} from "./headerPolicy";
+export {
+  InMemoryX402AccessEventStore,
+  InMemoryX402ResourceStore,
+  NoopX402AccessEventStore,
+  createAccessEvent,
+  validateX402Resource,
+} from "./resourceStore";
+export {
+  findBestRouteMatch,
+  interpolateUpstreamUrl,
+  matchRoutePattern,
+  parseRoutePattern,
+  type CompiledRoutePattern,
+  type RouteMatch,
+  type RoutePatternSegment,
+} from "./routePattern";
+export {
+  InMemoryX402LeaseUseStore,
+  createHttpStreamLeaseToken,
+  issueHttpStreamLease,
+  verifyHttpStreamLeaseToken,
+  type HttpStreamLeaseIssueResult,
+  type HttpStreamLeasePayload,
+  type X402LeaseUseStore,
+} from "./streamLease";
+export { X402ResourceRuntime, endpointToResource } from "./resourceRuntime";

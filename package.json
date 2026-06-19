@@ -27,7 +27,7 @@
     "node": ">=20"
   },
   "peerDependencies": {
-    "express": "^5.0.0"
+    "express": "^4.0.0 || ^5.0.0"
   },
   "dependencies": {
     "@x402/core": "^2.2.0",

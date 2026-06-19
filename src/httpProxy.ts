@@ -4,30 +4,13 @@ import { isIP } from "node:net";
 import type { Request, RequestHandler, Response } from "express";
 
 import { SecurityPolicyError, UpstreamRequestError, UpstreamTimeoutError } from "./errors";
-import type { HeaderPolicy, HttpProxyEndpointConfig, SecurityConfig } from "./types";
-
-const HOP_BY_HOP_HEADERS = new Set([
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-]);
-
-const INTERNAL_PAYMENT_HEADERS = new Set([
-  "payment-signature",
-  "payment-required",
-  "payment-response",
-  "x-payment",
-  "x-payment-response",
-]);
+import { applyUpstreamResponseHeaders, createForwardHeaders } from "./headerPolicy";
+import { interpolateUpstreamUrl } from "./routePattern";
+import type { HttpMethod, HttpProxyEndpointConfig, SecurityConfig, X402HeaderPolicy } from "./types";
 
 const BODY_METHODS = new Set(["POST", "PUT", "PATCH"]);
 
-type EffectiveSecurityPolicy = {
+export type EffectiveSecurityPolicy = {
   allowInsecureHttpUpstream: boolean;
   allowPrivateIpUpstreams: boolean;
   upstreamTimeoutMs?: number;
@@ -84,7 +67,7 @@ function isPrivateOrLoopbackIp(address: string): boolean {
   return true;
 }
 
-async function assertUpstreamAllowed(url: URL, security: EffectiveSecurityPolicy): Promise<void> {
+export async function assertUpstreamAllowed(url: URL, security: EffectiveSecurityPolicy): Promise<void> {
   if (url.protocol === "http:" && !security.allowInsecureHttpUpstream) {
     throw new SecurityPolicyError("Insecure HTTP upstreams are disabled", { upstreamUrl: url.toString() });
   }
@@ -118,64 +101,6 @@ async function assertUpstreamAllowed(url: URL, security: EffectiveSecurityPolicy
   }
 }
 
-function normalizeHeaderAllowlist(allowlist?: string[]): Set<string> {
-  return new Set((allowlist ?? []).map((header) => header.toLowerCase()));
-}
-
-function shouldDropHeader(name: string): boolean {
-  const lower = name.toLowerCase();
-  return (
-    HOP_BY_HOP_HEADERS.has(lower) ||
-    INTERNAL_PAYMENT_HEADERS.has(lower) ||
-    lower === "host" ||
-    lower === "content-length"
-  );
-}
-
-function createForwardHeaders(req: Request, policy?: HeaderPolicy): Headers {
-  const allowed = normalizeHeaderAllowlist(policy?.forwardRequestHeaders);
-  const headers = new Headers();
-
-  for (const [headerName, headerValue] of Object.entries(req.headers)) {
-    const lower = headerName.toLowerCase();
-    if (allowed.size === 0 || !allowed.has(lower) || shouldDropHeader(lower)) {
-      continue;
-    }
-    if (headerValue === undefined) {
-      continue;
-    }
-    headers.set(lower, Array.isArray(headerValue) ? headerValue.join(", ") : headerValue);
-  }
-
-  for (const [headerName, headerValue] of Object.entries(policy?.addRequestHeaders ?? {})) {
-    const lower = headerName.toLowerCase();
-    if (shouldDropHeader(lower)) {
-      continue;
-    }
-    headers.set(headerName, headerValue);
-  }
-
-  return headers;
-}
-
-function applyUpstreamResponseHeaders(res: Response, upstreamResponse: globalThis.Response, policy?: HeaderPolicy): void {
-  const allowed = normalizeHeaderAllowlist(policy?.forwardResponseHeaders);
-  for (const [headerName, headerValue] of upstreamResponse.headers.entries()) {
-    const lower = headerName.toLowerCase();
-    if (allowed.size === 0 || !allowed.has(lower) || shouldDropHeader(lower)) {
-      continue;
-    }
-    res.setHeader(headerName, headerValue);
-  }
-
-  for (const [headerName, headerValue] of Object.entries(policy?.addResponseHeaders ?? {})) {
-    if (shouldDropHeader(headerName.toLowerCase())) {
-      continue;
-    }
-    res.setHeader(headerName, headerValue);
-  }
-}
-
 function createTargetUrl(endpoint: HttpProxyEndpointConfig, req: Request): URL {
   const target = new URL(endpoint.upstreamUrl);
   const incoming = new URL(req.originalUrl, "http://localhost");
@@ -184,6 +109,29 @@ function createTargetUrl(endpoint: HttpProxyEndpointConfig, req: Request): URL {
   }
   return target;
 }
+
+export type HttpProxyResourceTarget = {
+  id: string;
+  method: HttpMethod;
+  upstreamUrl: string;
+  headers?: X402HeaderPolicy;
+  maxTimeoutSeconds?: number;
+};
+
+export type ProxyHttpRequestInput = {
+  target: HttpProxyResourceTarget;
+  req: Request;
+  res: Response;
+  securityConfig?: SecurityConfig;
+  params?: Record<string, string>;
+  excludeQueryParams?: string[];
+};
+
+export type BufferedProxyResponse = {
+  status: number;
+  response: globalThis.Response;
+  body: Buffer;
+};
 
 function serializeBodyFromParsedBody(parsedBody: unknown): Uint8Array | string {
   if (Buffer.isBuffer(parsedBody)) {
@@ -217,7 +165,7 @@ async function readRequestBody(req: Request): Promise<Uint8Array | string | unde
   return new Uint8Array(Buffer.concat(chunks));
 }
 
-function resolveTimeoutMs(endpoint: HttpProxyEndpointConfig, security: EffectiveSecurityPolicy): number {
+function resolveTimeoutMs(endpoint: Pick<HttpProxyResourceTarget, "maxTimeoutSeconds">, security: EffectiveSecurityPolicy): number {
   if (security.upstreamTimeoutMs && security.upstreamTimeoutMs > 0) {
     return security.upstreamTimeoutMs;
   }
@@ -225,6 +173,141 @@ function resolveTimeoutMs(endpoint: HttpProxyEndpointConfig, security: Effective
     return endpoint.maxTimeoutSeconds * 1000;
   }
   return 30_000;
+}
+
+function createInterpolatedTargetUrl(
+  target: Pick<HttpProxyResourceTarget, "upstreamUrl">,
+  req: Request,
+  params: Record<string, string> = {},
+  excludeQueryParams: string[] = [],
+): URL {
+  return interpolateUpstreamUrl(
+    target.upstreamUrl,
+    params,
+    req.originalUrl,
+    new Set(excludeQueryParams.map((value) => value.toLowerCase())),
+  );
+}
+
+function toAbortErrorResponse(error: Error, targetId: string): UpstreamTimeoutError {
+  return new UpstreamTimeoutError("Upstream request timed out", {
+    endpointId: targetId,
+  });
+}
+
+export async function proxyBufferedHttpRequest(input: ProxyHttpRequestInput): Promise<BufferedProxyResponse> {
+  const security = toEffectiveSecurityPolicy(input.securityConfig);
+  const targetUrl = createInterpolatedTargetUrl(
+    input.target,
+    input.req,
+    input.params,
+    input.excludeQueryParams,
+  );
+  await assertUpstreamAllowed(targetUrl, security);
+
+  const body = await readRequestBody(input.req);
+  const timeoutMs = resolveTimeoutMs(input.target, security);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  const headers = createForwardHeaders(input.req, input.target.headers);
+  const requestInit: RequestInit = {
+    method: input.req.method,
+    headers,
+    signal: controller.signal,
+  };
+  if (body !== undefined) {
+    requestInit.body = body as unknown as BodyInit;
+  }
+
+  let response: globalThis.Response;
+  try {
+    response = await fetch(targetUrl, requestInit);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const responseBuffer = Buffer.from(await response.arrayBuffer());
+  return {
+    status: response.status,
+    response,
+    body: responseBuffer,
+  };
+}
+
+export async function sendBufferedProxyResponse(
+  res: Response,
+  result: BufferedProxyResponse,
+  policy?: X402HeaderPolicy,
+): Promise<void> {
+  applyUpstreamResponseHeaders(res, result.response, policy);
+  res.status(result.status);
+  res.send(result.body);
+}
+
+export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): Promise<void> {
+  const security = toEffectiveSecurityPolicy(input.securityConfig);
+  const targetUrl = createInterpolatedTargetUrl(
+    input.target,
+    input.req,
+    input.params,
+    input.excludeQueryParams,
+  );
+  await assertUpstreamAllowed(targetUrl, security);
+
+  const body = await readRequestBody(input.req);
+  const timeoutMs = resolveTimeoutMs(input.target, security);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let clientClosed = false;
+  input.req.on("close", () => {
+    clientClosed = true;
+    controller.abort();
+  });
+
+  const headers = createForwardHeaders(input.req, input.target.headers);
+  const requestInit: RequestInit = {
+    method: input.req.method,
+    headers,
+    signal: controller.signal,
+  };
+  if (body !== undefined) {
+    requestInit.body = body as unknown as BodyInit;
+  }
+
+  let response: globalThis.Response;
+  try {
+    response = await fetch(targetUrl, requestInit);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  applyUpstreamResponseHeaders(input.res, response, input.target.headers);
+  input.res.status(response.status);
+
+  if (!response.body) {
+    input.res.end();
+    return;
+  }
+
+  const reader = response.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (clientClosed) {
+        break;
+      }
+      input.res.write(Buffer.from(value));
+    }
+    if (!input.res.writableEnded) {
+      input.res.end();
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 /**
@@ -277,9 +360,7 @@ export function createHttpProxyHandler(
         return;
       }
       if (error instanceof Error && error.name === "AbortError") {
-        const timeoutError = new UpstreamTimeoutError("Upstream request timed out", {
-          endpointId: endpoint.id,
-        });
+        const timeoutError = toAbortErrorResponse(error, endpoint.id);
         res.status(504).json({ error: timeoutError.message, code: timeoutError.code });
         return;
       }

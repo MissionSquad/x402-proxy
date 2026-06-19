@@ -27,11 +27,84 @@ export type CurrencyInput = {
  * Request/response header forwarding and static header injection policy.
  */
 export type HeaderPolicy = {
+  presets?: X402HeaderPreset[];
   forwardRequestHeaders?: string[];
   forwardResponseHeaders?: string[];
   addRequestHeaders?: Record<string, string>;
   addResponseHeaders?: Record<string, string>;
 };
+
+export type X402ResourceKind = "http" | "http-stream" | "websocket";
+
+export type X402AccessMode = "pass-through" | "service-token";
+
+export type X402HeaderPreset = "none" | "api-auth" | "browser-auth" | "streaming";
+
+export type X402HeaderPolicy = {
+  presets?: X402HeaderPreset[];
+  forwardRequestHeaders?: string[];
+  forwardResponseHeaders?: string[];
+  addRequestHeaders?: Record<string, string>;
+  addResponseHeaders?: Record<string, string>;
+};
+
+export type X402Resource = {
+  id: string;
+  enabled: boolean;
+  kind: X402ResourceKind;
+  publicPath: string;
+  upstreamUrl: string;
+  method: HttpMethod;
+  pricing: {
+    amount: string;
+    network: Network;
+    payTo: string;
+    asset?: string;
+    decimals?: number;
+  };
+  headers?: X402HeaderPolicy;
+  access?: {
+    mode: X402AccessMode;
+    serviceTokenHeader?: string;
+    serviceTokenValue?: string;
+  };
+  stream?: {
+    leasePath: string;
+    leaseSeconds: number;
+    allowRenewal: boolean;
+    renewalWindowSeconds: number;
+  };
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type X402AccessEvent = {
+  id: string;
+  resourceId: string;
+  kind: "challenge" | "verified" | "settled" | "settlement_failed" | "lease_issued" | "lease_rejected";
+  requestMethod: string;
+  requestPath: string;
+  network?: Network;
+  payTo?: string;
+  amount?: string;
+  payer?: string;
+  transaction?: string;
+  statusCode?: number;
+  errorCode?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+};
+
+export interface X402ResourceStore {
+  listEnabledResources(): Promise<X402Resource[]>;
+  getResourceById(id: string): Promise<X402Resource | null>;
+  getResourceForRequest(method: string, path: string): Promise<X402Resource | null>;
+}
+
+export interface X402AccessEventStore {
+  record(event: X402AccessEvent): Promise<void>;
+}
 
 /**
  * Configuration for a paid HTTP endpoint that proxies to an upstream HTTP URL.
@@ -111,7 +184,10 @@ export type X402ProxySdkConfig = {
   defaultNetwork: Network;
   defaultPayTo: string;
   facilitator?: FacilitatorConfig;
-  endpoints: ProxyEndpointConfig[];
+  endpoints?: ProxyEndpointConfig[];
+  resourceStore?: X402ResourceStore;
+  accessEventStore?: X402AccessEventStore;
+  requireProtectedResources?: boolean;
   leaseTokenSecret: string;
   discovery?: DiscoveryConfig;
   security?: SecurityConfig;
@@ -124,7 +200,43 @@ export type X402ProxySdkConfig = {
 export type X402ProxySdk = {
   routes: Record<string, RouteConfig>;
   paymentMiddleware: RequestHandler;
+  refreshResources: () => Promise<X402ResourceRefreshResult>;
+  listLoadedResources: () => X402LoadedResource[];
+  diagnostics: () => X402ProxyDiagnostics;
   install: (app: Express) => void;
+};
+
+export type X402LoadedResource = {
+  id: string;
+  kind: X402ResourceKind;
+  method: HttpMethod;
+  publicPath: string;
+  paymentPath: string;
+  upstreamUrl: string;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type X402ResourceValidationIssue = {
+  resourceId: string;
+  reason: string;
+};
+
+export type X402ResourceRefreshResult = {
+  loaded: X402LoadedResource[];
+  invalid: X402ResourceValidationIssue[];
+  refreshedAt: number;
+};
+
+export type X402ProxyDiagnostics = {
+  loadedResourceCount: number;
+  invalidResourceCount: number;
+  invalidResources: X402ResourceValidationIssue[];
+  lastRefreshAt?: number;
+  facilitatorUrl?: string;
+  enabledNetworks: Network[];
+  storeType: string;
 };
 
 /**
