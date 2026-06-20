@@ -1255,7 +1255,7 @@
   dependencies:
     "@types/node" "*"
 
-"@vitest/coverage-v8@^4.0.2":
+"@vitest/coverage-v8@^4.1.9":
   version "4.1.9"
   resolved "https://registry.npmjs.org/@vitest/coverage-v8/-/coverage-v8-4.1.9.tgz#d4c26aa9f7bd8ca99ed6bbd1e97afcdbb77e9b89"
   integrity sha512-G9/lgqibheLVBDRuya45EbsEXTYcWoSG+TLg7i2axuzx0Eq62eXn+aWXyaVdV5vKvFSWd6ywcX8hA7la9Pvu8g==
