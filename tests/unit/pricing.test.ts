@@ -46,4 +46,11 @@ describe("resolvePrice", () => {
   it("rejects EVM override without explicit asset", () => {
     expect(() => resolvePrice("eip155:1", "0.10", { decimals: 6 })).toThrow(PriceConversionError);
   });
+
+  it("defaults to 6 decimals when an asset override omits decimals", () => {
+    expect(resolvePrice("eip155:8453", "0.01", { asset: "0xA" })).toEqual({
+      asset: "0xA",
+      amount: "10000",
+    });
+  });
 });

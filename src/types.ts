@@ -2,6 +2,8 @@ import type { RouteConfig } from "@x402/core/server";
 import type { Network } from "@x402/core/types";
 import type { Express, RequestHandler } from "express";
 
+import type { X402LeaseUseStore } from "./streamLease";
+
 /**
  * Supported HTTP methods for proxied endpoints.
  */
@@ -175,6 +177,13 @@ export type SecurityConfig = {
   allowInsecureHttpUpstream?: boolean;
   allowPrivateIpUpstreams?: boolean;
   upstreamTimeoutMs?: number;
+  /**
+   * Maximum buffered request body size in bytes for proxied requests whose body the
+   * proxy reads from the raw stream (i.e. no upstream body parser ran). Defaults to
+   * unlimited to avoid breaking large/streamed uploads; set a value to bound memory
+   * use. Requests exceeding the limit are rejected with HTTP 413.
+   */
+  maxRequestBodyBytes?: number;
 };
 
 /**
@@ -187,6 +196,13 @@ export type X402ProxySdkConfig = {
   endpoints?: ProxyEndpointConfig[];
   resourceStore?: X402ResourceStore;
   accessEventStore?: X402AccessEventStore;
+  /**
+   * Single-use lease consumption store for HTTP-stream lease tokens. Defaults to an
+   * in-process store, which only prevents replay within a single instance. Multi-instance
+   * or horizontally-scaled deployments MUST supply a shared store (e.g. Redis with atomic
+   * SET NX + TTL) to enforce single-use across the cluster.
+   */
+  leaseUseStore?: X402LeaseUseStore;
   requireProtectedResources?: boolean;
   leaseTokenSecret: string;
   discovery?: DiscoveryConfig;

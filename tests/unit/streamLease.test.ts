@@ -89,4 +89,61 @@ describe("streamLease", () => {
     expect(await store.consume(decoded.jti, decoded.exp)).toBe(true);
     expect(await store.consume(decoded.jti, decoded.exp)).toBe(false);
   });
+
+  it("rejects malformed, badly-signed, expired and non-JSON tokens", () => {
+    const secret = "lease-token-secret-with-32-characters";
+    const expected = {
+      resourceId: "chat-stream",
+      method: "POST" as const,
+      publicPath: "/paid/chat",
+      upstreamUrl: "https://upstream.example.com/chat",
+    };
+
+    expect(() => verifyHttpStreamLeaseToken("nodot", secret, expected)).toThrow(/Invalid lease token format/);
+
+    const valid = createHttpStreamLeaseToken(
+      {
+        resourceId: "chat-stream",
+        exp: Math.floor(Date.now() / 1000) + 60,
+        jti: "j",
+        method: "POST",
+        publicPath: "/paid/chat",
+        upstreamUrl: "https://upstream.example.com/chat",
+      },
+      secret,
+    );
+    const [payload] = valid.split(".");
+    expect(() => verifyHttpStreamLeaseToken(`${payload}.deadbeef`, secret, expected)).toThrow(
+      /Invalid lease token signature/,
+    );
+
+    const expired = createHttpStreamLeaseToken(
+      {
+        resourceId: "chat-stream",
+        exp: 1,
+        jti: "j",
+        method: "POST",
+        publicPath: "/paid/chat",
+        upstreamUrl: "https://upstream.example.com/chat",
+      },
+      secret,
+    );
+    expect(() => verifyHttpStreamLeaseToken(expired, secret, expected, 2)).toThrow(/Lease token expired/);
+  });
+
+  it("prunes expired entries from the in-memory use store", async () => {
+    const store = new InMemoryX402LeaseUseStore();
+    const past = Math.floor(Date.now() / 1000) - 10;
+    expect(await store.consume("old", past)).toBe(true);
+    // A second jti triggers cleanup of the expired "old" entry; reusing it then succeeds again.
+    expect(await store.consume("new", Math.floor(Date.now() / 1000) + 60)).toBe(true);
+    expect(await store.consume("old", Math.floor(Date.now() / 1000) + 60)).toBe(true);
+  });
+
+  it("throws when issuing a lease for a resource missing stream config", () => {
+    const { stream: _omitted, ...resource } = createStreamResource();
+    expect(() =>
+      issueHttpStreamLease(resource, "lease-token-secret-with-32-characters", new URL("https://p.test"), {}),
+    ).toThrow(LeaseTokenError);
+  });
 });

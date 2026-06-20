@@ -6,7 +6,8 @@ export type X402ProxyErrorCode =
   | "UPSTREAM_REQUEST_ERROR"
   | "UPSTREAM_TIMEOUT_ERROR"
   | "SECURITY_POLICY_ERROR"
-  | "LEASE_TOKEN_ERROR";
+  | "LEASE_TOKEN_ERROR"
+  | "REQUEST_BODY_TOO_LARGE_ERROR";
 
 export abstract class X402ProxyError extends Error {
   public readonly code: X402ProxyErrorCode;
@@ -71,5 +72,11 @@ export class SecurityPolicyError extends X402ProxyError {
 export class LeaseTokenError extends X402ProxyError {
   constructor(message: string, context?: Record<string, unknown>) {
     super("LeaseTokenError", "LEASE_TOKEN_ERROR", message, context);
+  }
+}
+
+export class RequestBodyTooLargeError extends X402ProxyError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super("RequestBodyTooLargeError", "REQUEST_BODY_TOO_LARGE_ERROR", message, context);
   }
 }

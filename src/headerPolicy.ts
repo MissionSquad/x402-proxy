@@ -27,23 +27,60 @@ const REQUEST_PRESET_HEADERS: Record<X402HeaderPreset, string[]> = {
   "api-auth": [
     "authorization",
     "x-api-key",
+    "x-webhook-secret",
     "content-type",
     "accept",
+    "accept-language",
     "user-agent",
     "x-client-id",
     "x-session-id",
+    "x-request-id",
+    "idempotency-key",
   ],
   "browser-auth": [
     "cookie",
     "authorization",
     "content-type",
     "accept",
+    "accept-language",
     "user-agent",
     "x-client-id",
     "x-session-id",
+    "x-request-id",
   ],
   streaming: [],
 };
+
+/**
+ * Response headers forwarded for every proxied response regardless of preset.
+ *
+ * Without these, a buffered (non-streaming) HTTP resource would forward zero upstream
+ * response headers, dropping Content-Type and breaking generic REST clients. Hop-by-hop,
+ * payment, content-length and content-encoding headers are intentionally excluded because
+ * the proxy re-frames the body (fetch transparently decompresses upstream bodies, so a
+ * forwarded Content-Encoding would describe bytes that are no longer encoded).
+ */
+const DEFAULT_RESPONSE_HEADERS = new Set([
+  "content-type",
+  "content-disposition",
+  "content-language",
+  "content-range",
+  "accept-ranges",
+  "cache-control",
+  "etag",
+  "last-modified",
+  "expires",
+  "vary",
+  "location",
+  "retry-after",
+  "www-authenticate",
+]);
+
+/**
+ * Response headers the proxy manages itself and must never copy verbatim from upstream,
+ * because the response body is re-encoded/re-buffered (length and encoding would be wrong).
+ */
+const MANAGED_RESPONSE_HEADERS = new Set(["content-encoding", "content-length"]);
 
 const RESPONSE_PRESET_HEADERS: Record<X402HeaderPreset, string[]> = {
   none: [],
@@ -114,12 +151,18 @@ export function applyUpstreamResponseHeaders(
   policy?: X402HeaderPolicy,
 ): void {
   const allowed = collectPresetHeaders(policy?.presets, RESPONSE_PRESET_HEADERS);
+  for (const header of DEFAULT_RESPONSE_HEADERS) {
+    allowed.add(header);
+  }
   for (const header of normalizeHeaderList(policy?.forwardResponseHeaders)) {
     allowed.add(header);
   }
 
   for (const [headerName, headerValue] of upstreamResponse.headers.entries()) {
     const lower = headerName.toLowerCase();
+    if (MANAGED_RESPONSE_HEADERS.has(lower)) {
+      continue;
+    }
     if (!allowed.has(lower) || shouldDropProxyHeader(lower)) {
       continue;
     }

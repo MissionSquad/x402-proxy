@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { buildRoutes, createHttpRouteKey, createWsLeaseRouteKey } from "../../src/routeBuilder";
+import { RouteBuildError } from "../../src/errors";
+import {
+  buildRouteConfig,
+  buildRoutes,
+  createHttpRouteKey,
+  createWsLeaseRouteKey,
+} from "../../src/routeBuilder";
 
 describe("routeBuilder", () => {
   it("creates route keys", () => {
@@ -41,5 +47,34 @@ describe("routeBuilder", () => {
       scheme: "exact",
       network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
     });
+  });
+
+  it("throws on a duplicate route key", () => {
+    expect(() =>
+      buildRoutes([
+        { path: "/p", method: "GET", price: "0.01", network: "eip155:8453", payTo: "0x", description: "a" },
+        { path: "/p", method: "GET", price: "0.02", network: "eip155:8453", payTo: "0x", description: "b" },
+      ]),
+    ).toThrow(RouteBuildError);
+  });
+
+  it("applies default mimeType/maxTimeoutSeconds and omits an empty resource", () => {
+    const config = buildRouteConfig(
+      "/p",
+      "0.01",
+      { network: "eip155:8453", payTo: "0x", publicResourceUrl: () => undefined },
+      "desc",
+    );
+    expect(config.mimeType).toBe("application/json");
+    expect(config.accepts).toMatchObject({ maxTimeoutSeconds: 60 });
+    expect(config.resource).toBeUndefined();
+  });
+
+  it("builds a route without optional fields", () => {
+    const routes = buildRoutes([
+      { path: "/q", method: "GET", price: "0.01", network: "eip155:8453", payTo: "0x", description: "q" },
+    ]);
+    expect(routes["GET /q"]?.resource).toBeUndefined();
+    expect(routes["GET /q"]?.accepts).toMatchObject({ maxTimeoutSeconds: 60 });
   });
 });

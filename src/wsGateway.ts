@@ -158,10 +158,20 @@ export function installWebSocketGateway(
       };
 
       clientConn.onMessage((data) => {
-        if (!closed) upstream.send(data);
+        if (closed) return;
+        try {
+          upstream.send(data);
+        } catch {
+          closeBoth(CLOSE_INTERNAL_ERROR, "upstream send failed");
+        }
       });
       upstream.onMessage((data) => {
-        if (!closed) clientConn.send(data);
+        if (closed) return;
+        try {
+          clientConn.send(data);
+        } catch {
+          closeBoth(CLOSE_INTERNAL_ERROR, "client send failed");
+        }
       });
       clientConn.onError(() => closeBoth(CLOSE_INTERNAL_ERROR, "client websocket error"));
       upstream.onError(() => closeBoth(CLOSE_INTERNAL_ERROR, "upstream websocket error"));

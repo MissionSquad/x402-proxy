@@ -3,17 +3,23 @@ import { isIP } from "node:net";
 
 import type { Request, RequestHandler, Response } from "express";
 
-import { SecurityPolicyError, UpstreamRequestError, UpstreamTimeoutError } from "./errors";
+import {
+  RequestBodyTooLargeError,
+  SecurityPolicyError,
+  UpstreamRequestError,
+  UpstreamTimeoutError,
+} from "./errors";
 import { applyUpstreamResponseHeaders, createForwardHeaders } from "./headerPolicy";
 import { interpolateUpstreamUrl } from "./routePattern";
 import type { HttpMethod, HttpProxyEndpointConfig, SecurityConfig, X402HeaderPolicy } from "./types";
 
-const BODY_METHODS = new Set(["POST", "PUT", "PATCH"]);
+const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 export type EffectiveSecurityPolicy = {
   allowInsecureHttpUpstream: boolean;
   allowPrivateIpUpstreams: boolean;
   upstreamTimeoutMs?: number;
+  maxRequestBodyBytes?: number;
 };
 
 function toEffectiveSecurityPolicy(security?: SecurityConfig): EffectiveSecurityPolicy {
@@ -24,7 +30,46 @@ function toEffectiveSecurityPolicy(security?: SecurityConfig): EffectiveSecurity
   if (security?.upstreamTimeoutMs !== undefined) {
     policy.upstreamTimeoutMs = security.upstreamTimeoutMs;
   }
+  if (security?.maxRequestBodyBytes !== undefined) {
+    policy.maxRequestBodyBytes = security.maxRequestBodyBytes;
+  }
   return policy;
+}
+
+/**
+ * Strip surrounding IPv6 brackets and any zone identifier so the address can be
+ * classified. `URL.hostname` returns IPv6 literals as "[::1]" (with brackets), which
+ * `net.isIP` does not recognize.
+ */
+function normalizeIpLiteral(host: string): string {
+  let value = host;
+  if (value.startsWith("[") && value.endsWith("]")) {
+    value = value.slice(1, -1);
+  }
+  const zoneIndex = value.indexOf("%");
+  if (zoneIndex !== -1) {
+    value = value.slice(0, zoneIndex);
+  }
+  return value;
+}
+
+/**
+ * Extract the embedded IPv4 address from an IPv4-mapped IPv6 address (::ffff:a.b.c.d
+ * dotted, ::ffff:hhhh:hhhh hex) or a deprecated IPv4-compatible address (::a.b.c.d).
+ * Node normalizes ::ffff:127.0.0.1 to the hex form ::ffff:7f00:1, so both must be handled.
+ */
+function extractEmbeddedIpv4(normalized: string): string | null {
+  const dotted = /^::(?:ffff:)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(normalized);
+  if (dotted && dotted[1]) {
+    return dotted[1];
+  }
+  const hex = /^::ffff:([0-9a-f]{1,4})(?::([0-9a-f]{1,4}))?$/.exec(normalized);
+  if (hex && hex[1]) {
+    const high = hex[2] !== undefined ? Number.parseInt(hex[1], 16) : 0;
+    const low = hex[2] !== undefined ? Number.parseInt(hex[2], 16) : Number.parseInt(hex[1], 16);
+    return `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
+  }
+  return null;
 }
 
 function isPrivateOrLoopbackIp(address: string): boolean {
@@ -49,18 +94,17 @@ function isPrivateOrLoopbackIp(address: string): boolean {
   }
 
   if (family === 6) {
-    const normalized = address.toLowerCase();
-    if (normalized === "::1") return true;
+    const normalized = normalizeIpLiteral(address.toLowerCase());
+    if (normalized === "::" || normalized === "::1") return true;
     if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true;
-    if (
-      normalized.startsWith("fe8") ||
-      normalized.startsWith("fe9") ||
-      normalized.startsWith("fea") ||
-      normalized.startsWith("feb")
-    ) {
-      return true;
+    // Link-local fe80::/10 and deprecated site-local fec0::/10.
+    if (/^fe[89abcdef]/.test(normalized)) return true;
+    // NAT64 well-known prefix 64:ff9b::/96 (reaches IPv4 hosts on NAT64 networks).
+    if (normalized.startsWith("64:ff9b:") || normalized.startsWith("64:ff9b::")) return true;
+    const embedded = extractEmbeddedIpv4(normalized);
+    if (embedded !== null) {
+      return isPrivateOrLoopbackIp(embedded);
     }
-    if (normalized.startsWith("::ffff:127.")) return true;
     return false;
   }
 
@@ -73,7 +117,7 @@ export async function assertUpstreamAllowed(url: URL, security: EffectiveSecurit
   }
 
   if (!security.allowPrivateIpUpstreams) {
-    const hostname = url.hostname;
+    const hostname = normalizeIpLiteral(url.hostname);
     if (hostname.toLowerCase() === "localhost") {
       throw new SecurityPolicyError("Private/loopback upstreams are disabled", { hostname });
     }
@@ -133,7 +177,17 @@ export type BufferedProxyResponse = {
   body: Buffer;
 };
 
-function serializeBodyFromParsedBody(parsedBody: unknown): Uint8Array | string {
+function getContentType(req: Request): string {
+  const value = req.headers["content-type"];
+  return typeof value === "string" ? value.toLowerCase() : "";
+}
+
+/**
+ * Re-serialize a body already parsed by an upstream body parser. Raw buffers/strings pass
+ * through verbatim; parsed objects are encoded to match the request's Content-Type so that
+ * urlencoded forms are not silently corrupted into JSON.
+ */
+function serializeBodyFromParsedBody(parsedBody: unknown, req: Request): Uint8Array | string {
   if (Buffer.isBuffer(parsedBody)) {
     return new Uint8Array(parsedBody);
   }
@@ -143,21 +197,35 @@ function serializeBodyFromParsedBody(parsedBody: unknown): Uint8Array | string {
   if (parsedBody instanceof Uint8Array) {
     return parsedBody;
   }
+  if (getContentType(req).includes("application/x-www-form-urlencoded")) {
+    return new URLSearchParams(parsedBody as Record<string, string>).toString();
+  }
   return new TextEncoder().encode(JSON.stringify(parsedBody));
 }
 
-async function readRequestBody(req: Request): Promise<Uint8Array | string | undefined> {
+async function readRequestBody(
+  req: Request,
+  maxBytes?: number,
+): Promise<Uint8Array | string | undefined> {
   if (!BODY_METHODS.has(req.method.toUpperCase())) {
     return undefined;
   }
 
   if (req.body !== undefined) {
-    return serializeBodyFromParsedBody(req.body);
+    return serializeBodyFromParsedBody(req.body, req);
   }
 
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (maxBytes !== undefined && total > maxBytes) {
+      throw new RequestBodyTooLargeError("Request body exceeds the configured maximum size", {
+        maxRequestBodyBytes: maxBytes,
+      });
+    }
+    chunks.push(buffer);
   }
   if (chunks.length === 0) {
     return undefined;
@@ -189,7 +257,7 @@ function createInterpolatedTargetUrl(
   );
 }
 
-function toAbortErrorResponse(error: Error, targetId: string): UpstreamTimeoutError {
+function toAbortErrorResponse(targetId: string): UpstreamTimeoutError {
   return new UpstreamTimeoutError("Upstream request timed out", {
     endpointId: targetId,
   });
@@ -205,7 +273,7 @@ export async function proxyBufferedHttpRequest(input: ProxyHttpRequestInput): Pr
   );
   await assertUpstreamAllowed(targetUrl, security);
 
-  const body = await readRequestBody(input.req);
+  const body = await readRequestBody(input.req, security.maxRequestBodyBytes);
   const timeoutMs = resolveTimeoutMs(input.target, security);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -215,6 +283,7 @@ export async function proxyBufferedHttpRequest(input: ProxyHttpRequestInput): Pr
     method: input.req.method,
     headers,
     signal: controller.signal,
+    redirect: "manual",
   };
   if (body !== undefined) {
     requestInit.body = body as unknown as BodyInit;
@@ -255,7 +324,7 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
   );
   await assertUpstreamAllowed(targetUrl, security);
 
-  const body = await readRequestBody(input.req);
+  const body = await readRequestBody(input.req, security.maxRequestBodyBytes);
   const timeoutMs = resolveTimeoutMs(input.target, security);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -270,6 +339,7 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
     method: input.req.method,
     headers,
     signal: controller.signal,
+    redirect: "manual",
   };
   if (body !== undefined) {
     requestInit.body = body as unknown as BodyInit;
@@ -278,6 +348,12 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
   let response: globalThis.Response;
   try {
     response = await fetch(targetUrl, requestInit);
+  } catch (error: unknown) {
+    // A client disconnect aborts the shared controller; there is nothing left to send.
+    if (clientClosed) {
+      return;
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -300,7 +376,19 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
       if (clientClosed) {
         break;
       }
-      input.res.write(Buffer.from(value));
+      // Honor backpressure: if the client socket buffer is full, wait for it to drain
+      // (or for the client to disconnect) before pulling the next upstream chunk.
+      if (!input.res.write(Buffer.from(value)) && !clientClosed) {
+        await new Promise<void>((resolve) => {
+          const settle = (): void => {
+            input.res.off("drain", settle);
+            input.req.off("close", settle);
+            resolve();
+          };
+          input.res.once("drain", settle);
+          input.req.once("close", settle);
+        });
+      }
     }
     if (!input.res.writableEnded) {
       input.res.end();
@@ -328,7 +416,7 @@ export function createHttpProxyHandler(
       const targetUrl = createTargetUrl(endpoint, req);
       await assertUpstreamAllowed(targetUrl, security);
 
-      const body = await readRequestBody(req);
+      const body = await readRequestBody(req, security.maxRequestBodyBytes);
       const timeoutMs = resolveTimeoutMs(endpoint, security);
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -338,6 +426,7 @@ export function createHttpProxyHandler(
         method: req.method,
         headers,
         signal: controller.signal,
+        redirect: "manual",
       };
       if (body !== undefined) {
         requestInit.body = body as unknown as BodyInit;
@@ -359,8 +448,12 @@ export function createHttpProxyHandler(
         res.status(403).json({ error: error.message, code: error.code });
         return;
       }
+      if (error instanceof RequestBodyTooLargeError) {
+        res.status(413).json({ error: error.message, code: error.code });
+        return;
+      }
       if (error instanceof Error && error.name === "AbortError") {
-        const timeoutError = toAbortErrorResponse(error, endpoint.id);
+        const timeoutError = toAbortErrorResponse(endpoint.id);
         res.status(504).json({ error: timeoutError.message, code: timeoutError.code });
         return;
       }
