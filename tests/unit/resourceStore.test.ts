@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
 
+import { RouteBuildError, ValidationError } from "../../src/errors";
 import { createResourceServer } from "../../src/x402Server";
 import { X402ResourceRuntime } from "../../src/resourceRuntime";
-import { InMemoryX402ResourceStore, validateX402Resource } from "../../src/resourceStore";
-import type { X402Resource } from "../../src/types";
+import {
+  createAccessEvent,
+  InMemoryX402AccessEventStore,
+  InMemoryX402ResourceStore,
+  NoopX402AccessEventStore,
+  validateX402Resource,
+} from "../../src/resourceStore";
+import type { X402AccessEvent, X402Resource } from "../../src/types";
 
 function createResource(overrides: Partial<X402Resource> = {}): X402Resource {
   return {
@@ -68,5 +75,88 @@ describe("resourceStore", () => {
     expect(result.loaded.map((resource) => resource.id)).toEqual(["dynamic-chat"]);
     expect(result.invalid).toHaveLength(1);
     expect(runtime.diagnostics().invalidResourceCount).toBe(1);
+  });
+
+  it("reports a specific reason for each invalid resource field", () => {
+    const reasons = (resource: X402Resource): string[] =>
+      validateX402Resource(resource).map((issue) => issue.reason);
+
+    expect(reasons(createResource({ id: "" }))).toContain("id must be a non-empty string");
+    expect(reasons(createResource({ kind: "bogus" as X402Resource["kind"] }))).toContain(
+      "kind must be http, http-stream, or websocket",
+    );
+    expect(reasons(createResource({ method: "TRACE" as X402Resource["method"] }))).toContain(
+      "method is not supported",
+    );
+    expect(reasons(createResource({ publicPath: "no-slash" }))).toContain("publicPath must start with /");
+    expect(
+      reasons(createResource({ kind: "websocket", upstreamUrl: "https://x", stream: { leasePath: "/l", leaseSeconds: 60, allowRenewal: false, renewalWindowSeconds: 0 } })),
+    ).toContain("websocket upstreamUrl must use ws: or wss:");
+    expect(reasons(createResource({ upstreamUrl: "ftp://x" }))).toContain("upstreamUrl must use http: or https:");
+    expect(reasons(createResource({ pricing: { amount: "0", network: "eip155:8453", payTo: "0xPayee" } }))).toContain(
+      "pricing.amount must be a positive decimal string",
+    );
+    expect(reasons(createResource({ pricing: { amount: "0.01", network: "bad" as X402Resource["pricing"]["network"], payTo: "0xPayee" } }))).toContain(
+      "pricing.network must be CAIP-2 and use eip155:* or solana:*",
+    );
+    expect(reasons(createResource({ pricing: { amount: "0.01", network: "eip155:8453", payTo: "" } }))).toContain(
+      "pricing.payTo must be a non-empty string",
+    );
+    expect(reasons(createResource({ kind: "http-stream" }))).toContain(
+      "stream config is required for http-stream and websocket resources",
+    );
+    expect(
+      reasons(
+        createResource({
+          kind: "http-stream",
+          stream: { leasePath: "nope", leaseSeconds: 0, allowRenewal: false, renewalWindowSeconds: -1 },
+        }),
+      ),
+    ).toEqual(
+      expect.arrayContaining([
+        "stream.leasePath must start with /",
+        "stream.leaseSeconds must be > 0",
+        "stream.renewalWindowSeconds must be >= 0",
+      ]),
+    );
+  });
+
+  it("throws when constructing a store with invalid resources", () => {
+    expect(() => new InMemoryX402ResourceStore([createResource({ id: "" })])).toThrow(ValidationError);
+  });
+
+  it("throws on duplicate enabled resource routes", () => {
+    expect(
+      () =>
+        new InMemoryX402ResourceStore([
+          createResource({ id: "a" }),
+          createResource({ id: "b" }),
+        ]),
+    ).toThrow(RouteBuildError);
+  });
+
+  it("looks up resources by id and lists only enabled ones", async () => {
+    const store = new InMemoryX402ResourceStore([
+      createResource({ id: "enabled" }),
+      createResource({ id: "disabled", enabled: false, publicPath: "/paid/other/[username]/[slug]/chat" }),
+    ]);
+    expect((await store.getResourceById("enabled"))?.id).toBe("enabled");
+    expect(await store.getResourceById("missing")).toBeNull();
+    expect((await store.listEnabledResources()).map((resource) => resource.id)).toEqual(["enabled"]);
+  });
+
+  it("provides noop and in-memory access event stores", async () => {
+    await expect(new NoopX402AccessEventStore().record({} as X402AccessEvent)).resolves.toBeUndefined();
+    const store = new InMemoryX402AccessEventStore();
+    const event = createAccessEvent({
+      resourceId: "r",
+      kind: "verified",
+      requestMethod: "GET",
+      requestPath: "/p",
+    });
+    await store.record(event);
+    expect(store.events).toContain(event);
+    expect(event.id).toBeTruthy();
+    expect(event.createdAt).toBeGreaterThan(0);
   });
 });

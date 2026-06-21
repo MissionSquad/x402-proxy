@@ -4,7 +4,15 @@ import type { PaymentRequirements, PaymentPayload, Network } from "@x402/core/ty
 import type { Express, Request, RequestHandler, Response } from "express";
 
 import { resolvePrice } from "./currency";
-import { LeaseTokenError, RouteBuildError, SecurityPolicyError, UpstreamRequestError, UpstreamTimeoutError } from "./errors";
+import {
+  LeaseTokenError,
+  RequestBodyTooLargeError,
+  RouteBuildError,
+  SecurityPolicyError,
+  UpstreamRequestError,
+  UpstreamTimeoutError,
+  X402ProxyError,
+} from "./errors";
 import {
   proxyBufferedHttpRequest,
   proxyStreamingHttpRequest,
@@ -29,6 +37,7 @@ import type {
   DiscoveryConfig,
   HttpMethod,
   ProxyEndpointConfig,
+  X402AccessEvent,
   X402AccessEventStore,
   X402LoadedResource,
   X402ProxyDiagnostics,
@@ -209,6 +218,47 @@ function getTransaction(settleResult: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Map an error thrown during request handling to a clean JSON response. Never leaks stack
+ * traces or internal error context, guards against writing to an already-committed response,
+ * and gives every error a stable status + code contract.
+ */
+export function sendProxyErrorResponse(res: Response, error: unknown): void {
+  // If the response has already started, there is nothing safe to send.
+  if (res.headersSent) {
+    return;
+  }
+  if (error instanceof SecurityPolicyError) {
+    res.status(403).json({ error: error.message, code: error.code });
+    return;
+  }
+  if (error instanceof RequestBodyTooLargeError) {
+    res.status(413).json({ error: error.message, code: error.code });
+    return;
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    res.status(504).json({ error: "Upstream request timed out", code: "UPSTREAM_TIMEOUT_ERROR" });
+    return;
+  }
+  if (error instanceof UpstreamRequestError || error instanceof UpstreamTimeoutError) {
+    res.status(502).json({ error: error.message, code: error.code });
+    return;
+  }
+  if (error instanceof LeaseTokenError) {
+    res.status(401).json({ error: "Invalid x402 lease token", code: error.code });
+    return;
+  }
+  // Any other typed proxy error (RouteBuildError, ValidationError, PriceConversionError,
+  // ConfigurationError) is an operational/config fault: 500 with a code, no stack.
+  if (error instanceof X402ProxyError) {
+    res.status(500).json({ error: error.message, code: error.code });
+    return;
+  }
+  // Unknown errors: emit a generic 500 (no stack/details) rather than deferring to the host
+  // app's default handler, which may serialize the stack outside production.
+  res.status(500).json({ error: "Internal proxy error", code: "INTERNAL_ERROR" });
+}
+
 export class X402ResourceRuntime {
   private readonly store: X402ResourceStore;
 
@@ -352,6 +402,18 @@ export class X402ResourceRuntime {
     }
   }
 
+  /**
+   * Record an access event without ever letting a failing audit store affect the
+   * user-facing result of a paid request. Audit writes are best-effort.
+   */
+  private async recordEvent(event: X402AccessEvent): Promise<void> {
+    try {
+      await this.eventStore.record(event);
+    } catch {
+      // Audit failures must not turn a successful (or already-handled) request into an error.
+    }
+  }
+
   private async processPayment(req: Request, res: Response, resource: X402Resource): Promise<PaymentVerifiedResult | null> {
     await this.ensureLoaded();
     const httpServer = this.httpServer;
@@ -381,7 +443,7 @@ export class X402ResourceRuntime {
       return null;
     }
     if (result.type === "payment-error") {
-      await this.eventStore.record(
+      await this.recordEvent(
         createAccessEvent({
           resourceId: resource.id,
           kind: "challenge",
@@ -410,7 +472,7 @@ export class X402ResourceRuntime {
     if (payer) {
       verifiedEvent.payer = payer;
     }
-    await this.eventStore.record(verifiedEvent);
+    await this.recordEvent(verifiedEvent);
     return result;
   }
 
@@ -431,7 +493,7 @@ export class X402ResourceRuntime {
       payment.declaredExtensions,
     );
     if (!settleResult.success) {
-      await this.eventStore.record(
+      await this.recordEvent(
         createAccessEvent({
           resourceId: resource.id,
           kind: "settlement_failed",
@@ -467,7 +529,7 @@ export class X402ResourceRuntime {
     if (transaction) {
       settledEvent.transaction = transaction;
     }
-    await this.eventStore.record(settledEvent);
+    await this.recordEvent(settledEvent);
     return true;
   }
 
@@ -541,7 +603,7 @@ export class X402ResourceRuntime {
         this.leaseTokenSecret,
         baseUrl,
       );
-      await this.eventStore.record(
+      await this.recordEvent(
         createAccessEvent({
           resourceId: resource.id,
           kind: "lease_issued",
@@ -558,7 +620,7 @@ export class X402ResourceRuntime {
     }
 
     const lease = issueHttpStreamLease(resource, this.leaseTokenSecret, baseUrl, match.params);
-    await this.eventStore.record(
+    await this.recordEvent(
       createAccessEvent({
         resourceId: resource.id,
         kind: "lease_issued",
@@ -576,7 +638,7 @@ export class X402ResourceRuntime {
   private async handleHttpStream(req: Request, res: Response, resource: X402Resource, match: RouteMatch): Promise<void> {
     const token = getLeaseToken(req);
     if (!token) {
-      await this.eventStore.record(
+      await this.recordEvent(
         createAccessEvent({
           resourceId: resource.id,
           kind: "lease_rejected",
@@ -606,7 +668,7 @@ export class X402ResourceRuntime {
         throw new LeaseTokenError("Lease token already used");
       }
     } catch (error: unknown) {
-      await this.eventStore.record(
+      await this.recordEvent(
         createAccessEvent({
           resourceId: resource.id,
           kind: "lease_rejected",
@@ -671,19 +733,7 @@ export class X402ResourceRuntime {
         }
         next();
       } catch (error: unknown) {
-        if (error instanceof SecurityPolicyError) {
-          res.status(403).json({ error: error.message, code: error.code });
-          return;
-        }
-        if (error instanceof Error && error.name === "AbortError") {
-          res.status(504).json({ error: "Upstream request timed out", code: "UPSTREAM_TIMEOUT_ERROR" });
-          return;
-        }
-        if (error instanceof UpstreamRequestError || error instanceof UpstreamTimeoutError || error instanceof LeaseTokenError) {
-          res.status(502).json({ error: error.message, code: error.code });
-          return;
-        }
-        next(error);
+        sendProxyErrorResponse(res, error);
       }
     };
   }

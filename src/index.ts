@@ -29,6 +29,7 @@ export {
   ConfigurationError,
   LeaseTokenError,
   PriceConversionError,
+  RequestBodyTooLargeError,
   RouteBuildError,
   SecurityPolicyError,
   UpstreamRequestError,
@@ -52,6 +53,17 @@ export {
   createForwardHeaders,
   shouldDropProxyHeader,
 } from "./headerPolicy";
+export {
+  assertUpstreamAllowed,
+  createHttpProxyHandler,
+  proxyBufferedHttpRequest,
+  proxyStreamingHttpRequest,
+  sendBufferedProxyResponse,
+  type BufferedProxyResponse,
+  type EffectiveSecurityPolicy,
+  type HttpProxyResourceTarget,
+  type ProxyHttpRequestInput,
+} from "./httpProxy";
 export {
   InMemoryX402AccessEventStore,
   InMemoryX402ResourceStore,

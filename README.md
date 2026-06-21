@@ -145,3 +145,56 @@ installWebSocketGateway(adapter, connector, {
 Payment headers, hop-by-hop headers, `host`, `content-length`, and lease tokens are never forwarded
 upstream. Dynamic route params use `[name]` segments and upstream placeholders must come from the
 matched public path.
+
+## Header forwarding
+
+Request headers are forwarded only when allow-listed. Use a preset and/or `forwardRequestHeaders`:
+
+- `api-auth` forwards `authorization`, `x-api-key`, `x-webhook-secret`, `content-type`, `accept`,
+  `accept-language`, `user-agent`, `x-client-id`, `x-session-id`, `x-request-id`, `idempotency-key`.
+- `browser-auth` adds `cookie`.
+- `streaming` (response side) forwards `content-type`, `cache-control`, `connection`,
+  `x-accel-buffering`, `x-run-id`.
+
+For any other upstream-required header (custom signatures, etc.) add it to `headers.forwardRequestHeaders`.
+
+Responses always forward a safe default set (`content-type`, `content-disposition`,
+`content-language`, `content-range`, `accept-ranges`, `cache-control`, `etag`, `last-modified`,
+`expires`, `vary`, `location`, `retry-after`, `www-authenticate`) plus anything in
+`headers.forwardResponseHeaders`. `content-encoding` and `content-length` are never forwarded because
+the proxy re-frames the body (`fetch` transparently decompresses upstream responses). Upstream `3xx`
+responses are relayed verbatim (`Location` included) rather than followed.
+
+## Request bodies
+
+The proxy forwards `POST`, `PUT`, `PATCH`, and `DELETE` bodies. When no body parser has consumed the
+request stream, the raw bytes are forwarded verbatim (so `multipart/form-data` works as long as the
+host app does **not** mount a multipart parser on a proxied path). When a parser has already run,
+`application/x-www-form-urlencoded` bodies are re-encoded as form data and everything else as JSON.
+Set `security.maxRequestBodyBytes` to bound buffered body size (requests over the limit return `413`);
+it defaults to unlimited so large/streamed uploads are not broken by default.
+
+## Security and operational notes
+
+- **Upstream SSRF protection.** By default (`security.allowPrivateIpUpstreams: false`) upstream hosts
+  resolving to private, loopback, link-local, unique-local, CGNAT, multicast, IPv4-mapped-IPv6
+  (`::ffff:*`), or NAT64 (`64:ff9b::/96`) addresses are rejected, and `http:` upstreams require
+  `security.allowInsecureHttpUpstream: true`. Redirects are not followed. **Residual risk:** the
+  guard validates DNS before `fetch` re-resolves, so an attacker controlling an upstream hostname's
+  DNS can still mount a DNS-rebinding (TOCTOU) attack. For untrusted/dynamic upstreams, also enforce
+  egress controls at the network layer.
+- **Lease replay across instances.** The default lease single-use store and the WebSocket gateway's
+  consumed-token map are in-process only. In multi-instance/horizontally-scaled deployments supply a
+  shared `leaseUseStore` (e.g. Redis with atomic `SET NX` + TTL) and keep `leaseSeconds` small.
+- **Lease token transport.** Prefer the `x-x402-lease` request header over the `?t=` query parameter
+  (query strings leak via access logs, `Referer`, and browser history). Set `Referrer-Policy:
+  no-referrer` and scrub `t` from logs if the query form is unavoidable.
+- **`leaseTokenSecret`** must be a high-entropy random value (≥ 32 random bytes, e.g. from
+  `crypto.randomBytes`), kept out of source control and rotated periodically. The 32-character length
+  check is a floor, not a guarantee of entropy.
+- **Audit events are best-effort.** A failing `accessEventStore.record` never changes the user-facing
+  result of a paid request.
+- **Settlement ordering.** HTTP requests are settled after a successful (`< 400`) upstream response
+  (verify → proxy → settle). For non-idempotent upstreams a settlement failure after the upstream
+  side effect leaves the user un-charged for an action already performed; supply an `accessEventStore`
+  to capture `settlement_failed` events for reconciliation.

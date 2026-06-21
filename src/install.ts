@@ -1,9 +1,8 @@
 import type { Network, Price } from "@x402/core/types";
-import type { Express, RequestHandler } from "express";
+import type { Express } from "express";
 
 import { resolvePrice } from "./currency";
 import { installDiscoveryEndpoints } from "./discovery";
-import { createHttpProxyHandler } from "./httpProxy";
 import { createPaymentMiddleware } from "./payment";
 import { buildRoutes, type BuildEndpointRouteInput } from "./routeBuilder";
 import { endpointToResource, X402ResourceRuntime } from "./resourceRuntime";
@@ -11,7 +10,6 @@ import { InMemoryX402ResourceStore } from "./resourceStore";
 import {
   isHttpEndpoint,
   isWebSocketEndpoint,
-  type HttpMethod,
   type HttpProxyEndpointConfig,
   type ProxyEndpointConfig,
   type WebSocketProxyEndpointConfig,
@@ -19,7 +17,6 @@ import {
   type X402ProxySdkConfig,
 } from "./types";
 import { validateProxySdkConfig } from "./validation";
-import { createLeaseHandler } from "./wsLease";
 import { createResourceServer } from "./x402Server";
 
 type ResolvedHttpEndpoint = HttpProxyEndpointConfig & {
@@ -134,72 +131,6 @@ function buildRouteInputs(
   return routeInputs;
 }
 
-function registerMethodRoute(app: Express, method: HttpMethod | "POST", path: string, handler: RequestHandler): void {
-  switch (method) {
-    case "GET":
-      app.get(path, handler);
-      return;
-    case "POST":
-      app.post(path, handler);
-      return;
-    case "PUT":
-      app.put(path, handler);
-      return;
-    case "PATCH":
-      app.patch(path, handler);
-      return;
-    case "DELETE":
-      app.delete(path, handler);
-      return;
-    case "HEAD":
-      app.head(path, handler);
-      return;
-    case "OPTIONS":
-      app.options(path, handler);
-      return;
-    default: {
-      const exhaustive: never = method;
-      throw new Error(`Unsupported method: ${String(exhaustive)}`);
-    }
-  }
-}
-
-function installHttpEndpoints(app: Express, endpoints: ResolvedEndpoint[], config: X402ProxySdkConfig): void {
-  for (const endpoint of endpoints) {
-    if (endpoint.kind !== "http") {
-      continue;
-    }
-    const handler = createHttpProxyHandler(endpoint, config.security);
-    registerMethodRoute(app, endpoint.method, endpoint.publicPath, handler);
-  }
-}
-
-function installWebSocketLeaseEndpoints(
-  app: Express,
-  endpoints: ResolvedEndpoint[],
-  config: X402ProxySdkConfig,
-): void {
-  for (const endpoint of endpoints) {
-    if (endpoint.kind !== "websocket") {
-      continue;
-    }
-
-    const leaseHandlerInput: Parameters<typeof createLeaseHandler>[0] = {
-      endpoint,
-      secret: config.leaseTokenSecret,
-    };
-    if (config.discovery?.publicBaseUrl) {
-      leaseHandlerInput.publicBaseUrl = config.discovery.publicBaseUrl;
-    }
-    const leaseHandler = createLeaseHandler(leaseHandlerInput);
-    app.post(endpoint.leasePath, leaseHandler);
-
-    app.get(endpoint.wsPath, (_req, res) => {
-      res.status(426).json({ error: "Upgrade Required: connect via WebSocket with lease token" });
-    });
-  }
-}
-
 /**
  * Create configured x402 proxy SDK instance.
  */
@@ -235,6 +166,9 @@ export function createX402ProxySdk(config: X402ProxySdkConfig): X402ProxySdk {
   }
   if (config.accessEventStore) {
     runtimeInput.accessEventStore = config.accessEventStore;
+  }
+  if (config.leaseUseStore) {
+    runtimeInput.leaseUseStore = config.leaseUseStore;
   }
   if (!config.resourceStore) {
     runtimeInput.initialResources = staticResources;
