@@ -91,15 +91,23 @@ const RESPONSE_PRESET_HEADERS: Record<X402HeaderPreset, string[]> = {
 /** RFC 9110 field-name token: no whitespace, separators, or control characters. */
 const HEADER_NAME_TOKEN_REGEX = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
-/** CR, LF, and NUL in a field value enable header injection and make Headers.set throw. */
-const HEADER_VALUE_FORBIDDEN_REGEX = /[\r\n\0]/;
-
 export function isValidHttpHeaderName(name: string): boolean {
   return HEADER_NAME_TOKEN_REGEX.test(name);
 }
 
+/**
+ * Rejects the full control-character range (0x00-0x1F and DEL 0x7F), tab included.
+ * CR/LF/NUL enable header injection and make Headers.set throw; the remaining CTLs are
+ * forbidden in an RFC 9110 field value and always indicate a misconfigured credential.
+ */
 export function isValidHttpHeaderValue(value: string): boolean {
-  return !HEADER_VALUE_FORBIDDEN_REGEX.test(value);
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function shouldDropProxyHeader(name: string): boolean {
@@ -196,9 +204,10 @@ export function applyUpstreamResponseHeaders(
  * Apply a resource's `service-token` access mode to the outbound upstream headers,
  * replacing any client-supplied value for the same header. Runs after the header
  * policy so the injected credential always wins. Payment/hop-by-hop names, invalid
- * header-name tokens, and values containing CR/LF/NUL are refused here as defense in
- * depth (a custom resource store may bypass validateX402Resource; an invalid name or
- * value would otherwise throw in Headers.set or enable header injection).
+ * header-name tokens, and values containing control characters are refused here as
+ * defense in depth (a custom resource store may bypass validateX402Resource; an
+ * invalid name or value would otherwise throw in Headers.set or enable header
+ * injection).
  */
 export function applyServiceTokenAccess(headers: Headers, access?: X402ResourceAccess): void {
   if (access?.mode !== "service-token") {

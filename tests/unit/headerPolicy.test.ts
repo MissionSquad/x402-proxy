@@ -129,6 +129,17 @@ describe("applyServiceTokenAccess", () => {
         serviceTokenValue: "abc\r\nx-injected: 1",
       }),
     ).not.toThrow();
+    // Non-CR/LF control characters (SOH, DEL) are rejected too, not just injection bytes.
+    applyServiceTokenAccess(headers, {
+      mode: "service-token",
+      serviceTokenHeader: "x-service-auth",
+      serviceTokenValue: `abc${String.fromCharCode(1)}`,
+    });
+    applyServiceTokenAccess(headers, {
+      mode: "service-token",
+      serviceTokenHeader: "x-service-auth",
+      serviceTokenValue: `abc${String.fromCharCode(127)}`,
+    });
     expect(headers.get("authorization")).toBe("Bearer user-token");
     expect(headers.get("x-service-auth")).toBeNull();
     expect(headers.get("x-injected")).toBeNull();

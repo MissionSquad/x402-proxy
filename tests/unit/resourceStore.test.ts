@@ -130,6 +130,19 @@ describe("resourceStore", () => {
       "access.serviceTokenValue must not contain control characters",
     );
     expect(JSON.stringify(badValue)).not.toContain("Bearer abc");
+
+    const badCtl = validateX402Resource(
+      createResource({
+        access: {
+          mode: "service-token",
+          serviceTokenHeader: "Authorization",
+          serviceTokenValue: `Bearer abc${String.fromCharCode(127)}`,
+        },
+      }),
+    );
+    expect(badCtl.map((issue) => issue.reason)).toContain(
+      "access.serviceTokenValue must not contain control characters",
+    );
   });
 
   it("validates service-token access configuration without leaking the token value", () => {
