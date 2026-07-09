@@ -396,18 +396,22 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
         break;
       }
       // Honor backpressure: if the client socket buffer is full, wait for it to drain
-      // (or for the client to disconnect) before pulling the next upstream chunk.
+      // (or for the client to disconnect) before pulling the next upstream chunk. Also
+      // wake on the abort signal so the wait can never outlive the upstream request,
+      // regardless of what triggered the abort.
       if (!input.res.write(Buffer.from(value)) && !clientClosed) {
         await new Promise<void>((resolve) => {
           const settle = (): void => {
             input.res.off("drain", settle);
             input.res.off("close", settle);
             input.req.off("close", settle);
+            controller.signal.removeEventListener("abort", settle);
             resolve();
           };
           input.res.once("drain", settle);
           input.res.once("close", settle);
           input.req.once("close", settle);
+          controller.signal.addEventListener("abort", settle, { once: true });
         });
       }
     }
