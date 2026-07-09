@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
 
-import type { X402HeaderPolicy, X402HeaderPreset } from "./types";
+import type { X402HeaderPolicy, X402HeaderPreset, X402ResourceAccess } from "./types";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -22,31 +22,30 @@ const INTERNAL_PAYMENT_HEADERS = new Set([
   "x-x402-lease",
 ]);
 
+/**
+ * Preset request-header allowlists. These match the x402-proxy expansion spec exactly;
+ * anything beyond them (x-request-id, idempotency-key, webhook secrets, ...) must be
+ * opted into per resource via `forwardRequestHeaders`.
+ */
 const REQUEST_PRESET_HEADERS: Record<X402HeaderPreset, string[]> = {
   none: [],
   "api-auth": [
     "authorization",
     "x-api-key",
-    "x-webhook-secret",
     "content-type",
     "accept",
-    "accept-language",
     "user-agent",
     "x-client-id",
     "x-session-id",
-    "x-request-id",
-    "idempotency-key",
   ],
   "browser-auth": [
     "cookie",
     "authorization",
     "content-type",
     "accept",
-    "accept-language",
     "user-agent",
     "x-client-id",
     "x-session-id",
-    "x-request-id",
   ],
   streaming: [],
 };
@@ -89,6 +88,28 @@ const RESPONSE_PRESET_HEADERS: Record<X402HeaderPreset, string[]> = {
   streaming: ["content-type", "cache-control", "connection", "x-accel-buffering", "x-run-id"],
 };
 
+/** RFC 9110 field-name token: no whitespace, separators, or control characters. */
+const HEADER_NAME_TOKEN_REGEX = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+export function isValidHttpHeaderName(name: string): boolean {
+  return HEADER_NAME_TOKEN_REGEX.test(name);
+}
+
+/**
+ * Rejects the full control-character range (0x00-0x1F and DEL 0x7F), tab included.
+ * CR/LF/NUL enable header injection and make Headers.set throw; the remaining CTLs are
+ * forbidden in an RFC 9110 field value and always indicate a misconfigured credential.
+ */
+export function isValidHttpHeaderValue(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function shouldDropProxyHeader(name: string): boolean {
   const lower = name.toLowerCase();
   return (
@@ -121,11 +142,12 @@ export function createForwardHeaders(req: Request, policy?: X402HeaderPolicy): H
   for (const header of normalizeHeaderList(policy?.forwardRequestHeaders)) {
     allowed.add(header);
   }
+  const excluded = normalizeHeaderList(policy?.excludeRequestHeaders);
 
   const headers = new Headers();
   for (const [headerName, headerValue] of Object.entries(req.headers)) {
     const lower = headerName.toLowerCase();
-    if (!allowed.has(lower) || shouldDropProxyHeader(lower)) {
+    if (!allowed.has(lower) || excluded.has(lower) || shouldDropProxyHeader(lower)) {
       continue;
     }
     if (headerValue === undefined) {
@@ -157,13 +179,14 @@ export function applyUpstreamResponseHeaders(
   for (const header of normalizeHeaderList(policy?.forwardResponseHeaders)) {
     allowed.add(header);
   }
+  const excluded = normalizeHeaderList(policy?.excludeResponseHeaders);
 
   for (const [headerName, headerValue] of upstreamResponse.headers.entries()) {
     const lower = headerName.toLowerCase();
     if (MANAGED_RESPONSE_HEADERS.has(lower)) {
       continue;
     }
-    if (!allowed.has(lower) || shouldDropProxyHeader(lower)) {
+    if (!allowed.has(lower) || excluded.has(lower) || shouldDropProxyHeader(lower)) {
       continue;
     }
     res.setHeader(headerName, headerValue);
@@ -175,4 +198,30 @@ export function applyUpstreamResponseHeaders(
     }
     res.setHeader(headerName, headerValue);
   }
+}
+
+/**
+ * Apply a resource's `service-token` access mode to the outbound upstream headers,
+ * replacing any client-supplied value for the same header. Runs after the header
+ * policy so the injected credential always wins. Payment/hop-by-hop names, invalid
+ * header-name tokens, and values containing control characters are refused here as
+ * defense in depth (a custom resource store may bypass validateX402Resource; an
+ * invalid name or value would otherwise throw in Headers.set or enable header
+ * injection).
+ */
+export function applyServiceTokenAccess(headers: Headers, access?: X402ResourceAccess): void {
+  if (access?.mode !== "service-token") {
+    return;
+  }
+  const { serviceTokenHeader, serviceTokenValue } = access;
+  if (
+    !serviceTokenHeader ||
+    !serviceTokenValue ||
+    !isValidHttpHeaderName(serviceTokenHeader) ||
+    !isValidHttpHeaderValue(serviceTokenValue) ||
+    shouldDropProxyHeader(serviceTokenHeader.toLowerCase())
+  ) {
+    return;
+  }
+  headers.set(serviceTokenHeader, serviceTokenValue);
 }

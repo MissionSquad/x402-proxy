@@ -25,17 +25,6 @@ export type CurrencyInput = {
   symbol?: string;
 };
 
-/**
- * Request/response header forwarding and static header injection policy.
- */
-export type HeaderPolicy = {
-  presets?: X402HeaderPreset[];
-  forwardRequestHeaders?: string[];
-  forwardResponseHeaders?: string[];
-  addRequestHeaders?: Record<string, string>;
-  addResponseHeaders?: Record<string, string>;
-};
-
 export type X402ResourceKind = "http" | "http-stream" | "websocket";
 
 export type X402AccessMode = "pass-through" | "service-token";
@@ -46,8 +35,33 @@ export type X402HeaderPolicy = {
   presets?: X402HeaderPreset[];
   forwardRequestHeaders?: string[];
   forwardResponseHeaders?: string[];
+  /**
+   * Header names removed from the forwarded set after presets and forward lists are
+   * merged (e.g. drop `cookie` from `browser-auth`). Excludes apply only to headers
+   * copied from the inbound request/upstream response; explicitly configured
+   * addRequestHeaders/addResponseHeaders values are not affected.
+   */
+  excludeRequestHeaders?: string[];
+  excludeResponseHeaders?: string[];
   addRequestHeaders?: Record<string, string>;
   addResponseHeaders?: Record<string, string>;
+};
+
+/**
+ * Request/response header forwarding and static header injection policy.
+ */
+export type HeaderPolicy = X402HeaderPolicy;
+
+/**
+ * Upstream access behavior for a resource. `pass-through` forwards client credentials
+ * according to the header policy; `service-token` additionally injects a configured
+ * service credential header on the upstream request, replacing any client-supplied
+ * value for the same header.
+ */
+export type X402ResourceAccess = {
+  mode: X402AccessMode;
+  serviceTokenHeader?: string;
+  serviceTokenValue?: string;
 };
 
 export type X402Resource = {
@@ -65,11 +79,7 @@ export type X402Resource = {
     decimals?: number;
   };
   headers?: X402HeaderPolicy;
-  access?: {
-    mode: X402AccessMode;
-    serviceTokenHeader?: string;
-    serviceTokenValue?: string;
-  };
+  access?: X402ResourceAccess;
   stream?: {
     leasePath: string;
     leaseSeconds: number;

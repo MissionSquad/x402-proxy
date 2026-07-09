@@ -204,6 +204,44 @@ export function extractRoutePlaceholders(value: string): string[] {
   return names;
 }
 
+/**
+ * Placeholder occurrences in an upstream URL that interpolation will never substitute:
+ * only `[name]` occupying a full path segment is interpolated. Rather than enumerating
+ * URL parts (partial segments, query, fragment, userinfo, ...), compare every raw
+ * occurrence against the occurrences interpolation will actually rewrite — any surplus
+ * occurrence is misplaced wherever it appears, so the check is complete by construction.
+ * Returns null when the URL is invalid (reported separately by URL validation).
+ */
+export function findMisplacedUpstreamPlaceholders(upstreamUrl: string): string[] | null {
+  let target: URL;
+  try {
+    target = new URL(upstreamUrl);
+  } catch {
+    return null;
+  }
+
+  const rawCounts = new Map<string, number>();
+  for (const name of extractRoutePlaceholders(upstreamUrl)) {
+    rawCounts.set(name, (rawCounts.get(name) ?? 0) + 1);
+  }
+
+  const interpolatedCounts = new Map<string, number>();
+  for (const segment of target.pathname.split("/")) {
+    const match = PARAM_SEGMENT_REGEX.exec(segment);
+    if (match && match[1]) {
+      interpolatedCounts.set(match[1], (interpolatedCounts.get(match[1]) ?? 0) + 1);
+    }
+  }
+
+  const misplaced: string[] = [];
+  for (const [name, count] of rawCounts) {
+    if (count > (interpolatedCounts.get(name) ?? 0)) {
+      misplaced.push(name);
+    }
+  }
+  return misplaced;
+}
+
 export function interpolateUpstreamUrl(
   upstreamUrl: string,
   params: Record<string, string>,

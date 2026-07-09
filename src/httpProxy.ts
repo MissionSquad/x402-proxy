@@ -9,9 +9,15 @@ import {
   UpstreamRequestError,
   UpstreamTimeoutError,
 } from "./errors";
-import { applyUpstreamResponseHeaders, createForwardHeaders } from "./headerPolicy";
+import { applyServiceTokenAccess, applyUpstreamResponseHeaders, createForwardHeaders } from "./headerPolicy";
 import { interpolateUpstreamUrl } from "./routePattern";
-import type { HttpMethod, HttpProxyEndpointConfig, SecurityConfig, X402HeaderPolicy } from "./types";
+import type {
+  HttpMethod,
+  HttpProxyEndpointConfig,
+  SecurityConfig,
+  X402HeaderPolicy,
+  X402ResourceAccess,
+} from "./types";
 
 const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
@@ -159,6 +165,7 @@ export type HttpProxyResourceTarget = {
   method: HttpMethod;
   upstreamUrl: string;
   headers?: X402HeaderPolicy;
+  access?: X402ResourceAccess;
   maxTimeoutSeconds?: number;
 };
 
@@ -257,6 +264,14 @@ function createInterpolatedTargetUrl(
   );
 }
 
+/**
+ * Shape-based AbortError check: undici rejects aborted fetches/reads with a DOMException
+ * named "AbortError", which is not an `instanceof Error` on every Node version.
+ */
+export function isAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError";
+}
+
 function toAbortErrorResponse(targetId: string): UpstreamTimeoutError {
   return new UpstreamTimeoutError("Upstream request timed out", {
     endpointId: targetId,
@@ -279,6 +294,7 @@ export async function proxyBufferedHttpRequest(input: ProxyHttpRequestInput): Pr
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   const headers = createForwardHeaders(input.req, input.target.headers);
+  applyServiceTokenAccess(headers, input.target.access);
   const requestInit: RequestInit = {
     method: input.req.method,
     headers,
@@ -329,12 +345,23 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let clientClosed = false;
-  input.req.on("close", () => {
+  const abortForClientDisconnect = (): void => {
     clientClosed = true;
     controller.abort();
+  };
+  // In Node 20+, a server IncomingMessage does not reliably emit "close" when the client
+  // aborts mid-response; the response's "close" (fired on premature connection termination)
+  // is the dependable signal. Keep the request listener for request-side terminations and
+  // guard on writableEnded so a naturally completed response never aborts anything.
+  input.req.on("close", abortForClientDisconnect);
+  input.res.on("close", () => {
+    if (!input.res.writableEnded) {
+      abortForClientDisconnect();
+    }
   });
 
   const headers = createForwardHeaders(input.req, input.target.headers);
+  applyServiceTokenAccess(headers, input.target.access);
   const requestInit: RequestInit = {
     method: input.req.method,
     headers,
@@ -350,7 +377,8 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
     response = await fetch(targetUrl, requestInit);
   } catch (error: unknown) {
     // A client disconnect aborts the shared controller; there is nothing left to send.
-    if (clientClosed) {
+    // Swallow only the resulting abort rejection — any other failure is a real error.
+    if (clientClosed && isAbortError(error)) {
       return;
     }
     throw error;
@@ -377,21 +405,35 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
         break;
       }
       // Honor backpressure: if the client socket buffer is full, wait for it to drain
-      // (or for the client to disconnect) before pulling the next upstream chunk.
+      // (or for the client to disconnect) before pulling the next upstream chunk. Also
+      // wake on the abort signal so the wait can never outlive the upstream request,
+      // regardless of what triggered the abort.
       if (!input.res.write(Buffer.from(value)) && !clientClosed) {
         await new Promise<void>((resolve) => {
           const settle = (): void => {
             input.res.off("drain", settle);
+            input.res.off("close", settle);
             input.req.off("close", settle);
+            controller.signal.removeEventListener("abort", settle);
             resolve();
           };
           input.res.once("drain", settle);
+          input.res.once("close", settle);
           input.req.once("close", settle);
+          controller.signal.addEventListener("abort", settle, { once: true });
         });
       }
     }
     if (!input.res.writableEnded) {
       input.res.end();
+    }
+  } catch (error: unknown) {
+    // Aborting the upstream fetch after a client disconnect rejects the pending read
+    // with an AbortError; there is no one left to answer, so swallow only that case.
+    // Any other failure is a real relay error and must propagate even if the client
+    // is gone, so it stays visible to host-level error handling.
+    if (!(clientClosed && isAbortError(error))) {
+      throw error;
     }
   } finally {
     reader.releaseLock();
@@ -452,7 +494,7 @@ export function createHttpProxyHandler(
         res.status(413).json({ error: error.message, code: error.code });
         return;
       }
-      if (error instanceof Error && error.name === "AbortError") {
+      if (isAbortError(error)) {
         const timeoutError = toAbortErrorResponse(endpoint.id);
         res.status(504).json({ error: timeoutError.message, code: timeoutError.code });
         return;

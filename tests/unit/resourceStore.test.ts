@@ -44,6 +44,147 @@ describe("resourceStore", () => {
     );
   });
 
+  it("rejects upstream placeholders that do not occupy a full path segment", () => {
+    const partialSegment = validateX402Resource(
+      createResource({
+        upstreamUrl: "https://upstream.example.com/v1/user-[username]/[slug]/chat",
+      }),
+    );
+    expect(partialSegment.map((issue) => issue.reason)).toContain(
+      "upstreamUrl placeholder [username] must occupy a full path segment",
+    );
+
+    const queryPlaceholder = validateX402Resource(
+      createResource({
+        upstreamUrl: "https://upstream.example.com/v1/[username]/[slug]/chat?user=[username]",
+      }),
+    );
+    expect(queryPlaceholder.map((issue) => issue.reason)).toContain(
+      "upstreamUrl placeholder [username] must occupy a full path segment",
+    );
+
+    // Userinfo placeholders parse (percent-encoded) but are never interpolated.
+    const userinfoPlaceholder = validateX402Resource(
+      createResource({
+        upstreamUrl: "https://[username]@upstream.example.com/v1/[username]/[slug]/chat",
+      }),
+    );
+    expect(userinfoPlaceholder.map((issue) => issue.reason)).toContain(
+      "upstreamUrl placeholder [username] must occupy a full path segment",
+    );
+  });
+
+  it("rejects placeholders in websocket upstream URLs, which are connected verbatim", () => {
+    const issues = validateX402Resource(
+      createResource({
+        kind: "websocket",
+        method: "GET",
+        publicPath: "/ws/[room]/feed",
+        upstreamUrl: "wss://upstream.example.com/feed/[room]",
+        stream: {
+          leasePath: "/ws/lease",
+          leaseSeconds: 60,
+          allowRenewal: false,
+          renewalWindowSeconds: 0,
+        },
+      }),
+    );
+
+    expect(issues.map((issue) => issue.reason)).toContain(
+      "websocket upstreamUrl must not contain placeholder [room]",
+    );
+  });
+
+  it("rejects service-token mode on websocket resources", () => {
+    const issues = validateX402Resource(
+      createResource({
+        kind: "websocket",
+        method: "GET",
+        publicPath: "/ws/feed",
+        upstreamUrl: "wss://upstream.example.com/feed",
+        access: { mode: "service-token", serviceTokenHeader: "Authorization", serviceTokenValue: "Bearer svc" },
+        stream: {
+          leasePath: "/ws/lease",
+          leaseSeconds: 60,
+          allowRenewal: false,
+          renewalWindowSeconds: 0,
+        },
+      }),
+    );
+
+    expect(issues.map((issue) => issue.reason)).toContain(
+      "access.mode service-token is not supported for websocket resources",
+    );
+  });
+
+  it("rejects invalid service-token header names and control characters in values", () => {
+    const badName = validateX402Resource(
+      createResource({
+        access: { mode: "service-token", serviceTokenHeader: "X Auth ", serviceTokenValue: "ok" },
+      }),
+    );
+    expect(badName.map((issue) => issue.reason)).toContain(
+      "access.serviceTokenHeader must be a valid HTTP header name (RFC 9110 token, no whitespace)",
+    );
+
+    const badValue = validateX402Resource(
+      createResource({
+        access: {
+          mode: "service-token",
+          serviceTokenHeader: "Authorization",
+          serviceTokenValue: "Bearer abc\r\nX-Injected: 1",
+        },
+      }),
+    );
+    expect(badValue.map((issue) => issue.reason)).toContain(
+      "access.serviceTokenValue must not contain control characters",
+    );
+    expect(JSON.stringify(badValue)).not.toContain("Bearer abc");
+
+    const badCtl = validateX402Resource(
+      createResource({
+        access: {
+          mode: "service-token",
+          serviceTokenHeader: "Authorization",
+          serviceTokenValue: `Bearer abc${String.fromCharCode(127)}`,
+        },
+      }),
+    );
+    expect(badCtl.map((issue) => issue.reason)).toContain(
+      "access.serviceTokenValue must not contain control characters",
+    );
+  });
+
+  it("validates service-token access configuration without leaking the token value", () => {
+    const missingConfig = validateX402Resource(createResource({ access: { mode: "service-token" } }));
+    expect(missingConfig.map((issue) => issue.reason)).toEqual(
+      expect.arrayContaining([
+        "access.serviceTokenHeader is required for service-token mode",
+        "access.serviceTokenValue is required for service-token mode",
+      ]),
+    );
+
+    const protectedHeader = validateX402Resource(
+      createResource({
+        access: { mode: "service-token", serviceTokenHeader: "X-Payment", serviceTokenValue: "topsecret" },
+      }),
+    );
+    expect(protectedHeader.map((issue) => issue.reason)).toContain(
+      "access.serviceTokenHeader must not be a payment, hop-by-hop, host, or content-length header",
+    );
+    expect(JSON.stringify(protectedHeader)).not.toContain("topsecret");
+
+    const valid = validateX402Resource(
+      createResource({
+        access: { mode: "service-token", serviceTokenHeader: "Authorization", serviceTokenValue: "Bearer svc" },
+      }),
+    );
+    expect(valid).toEqual([]);
+
+    const passThrough = validateX402Resource(createResource({ access: { mode: "pass-through" } }));
+    expect(passThrough).toEqual([]);
+  });
+
   it("matches in-memory resources by dynamic path", async () => {
     const store = new InMemoryX402ResourceStore([createResource()]);
     const resource = await store.getResourceForRequest("POST", "/paid/agents/jayson/research/chat");

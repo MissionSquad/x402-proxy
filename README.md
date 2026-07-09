@@ -150,13 +150,47 @@ matched public path.
 
 Request headers are forwarded only when allow-listed. Use a preset and/or `forwardRequestHeaders`:
 
-- `api-auth` forwards `authorization`, `x-api-key`, `x-webhook-secret`, `content-type`, `accept`,
-  `accept-language`, `user-agent`, `x-client-id`, `x-session-id`, `x-request-id`, `idempotency-key`.
-- `browser-auth` adds `cookie`.
+- `api-auth` forwards `authorization`, `x-api-key`, `content-type`, `accept`, `user-agent`,
+  `x-client-id`, `x-session-id`.
+- `browser-auth` forwards `cookie`, `authorization`, `content-type`, `accept`, `user-agent`,
+  `x-client-id`, `x-session-id`.
 - `streaming` (response side) forwards `content-type`, `cache-control`, `connection`,
-  `x-accel-buffering`, `x-run-id`.
+  `x-accel-buffering`, `x-run-id` (note `connection` is hop-by-hop and is always stripped in
+  practice; it is listed for spec parity only).
 
-For any other upstream-required header (custom signatures, etc.) add it to `headers.forwardRequestHeaders`.
+For any other upstream-required header (custom signatures, `x-request-id`, `idempotency-key`,
+webhook secrets, etc.) add it to `headers.forwardRequestHeaders`. To remove a preset-granted header,
+list it in `headers.excludeRequestHeaders` / `headers.excludeResponseHeaders` (e.g. keep
+`browser-auth` but drop `cookie`). Excludes apply only to headers copied from the inbound
+request/upstream response; explicit `addRequestHeaders`/`addResponseHeaders` values are unaffected.
+
+### Upstream access modes
+
+HTTP resources (`kind: "http"` and `kind: "http-stream"`) may set `access.mode`:
+
+- `pass-through` (default): client credentials reach the upstream only per the header policy above.
+- `service-token`: the proxy injects `access.serviceTokenHeader: access.serviceTokenValue` on the
+  upstream request, replacing any client-supplied value for that header. Use this when the upstream
+  requires a private service credential the paying client does not have:
+
+```ts
+{
+  // ...resource fields...
+  headers: { presets: ["api-auth"] },
+  access: {
+    mode: "service-token",
+    serviceTokenHeader: "Authorization",
+    serviceTokenValue: `Bearer ${process.env.UPSTREAM_SERVICE_TOKEN}`,
+  },
+}
+```
+
+`serviceTokenHeader` must be a valid HTTP header name (RFC 9110 token — no whitespace) and must
+not be a payment, hop-by-hop, `host`, or `content-length` header; `serviceTokenValue` must not
+contain control characters (validation rejects all of these, and injection independently refuses
+them as defense in depth). The token value is never logged and never appears in diagnostics or
+discovery output. WebSocket resources are relayed without header forwarding or injection, so
+`service-token` does not apply to them and validation rejects the combination.
 
 Responses always forward a safe default set (`content-type`, `content-disposition`,
 `content-language`, `content-range`, `accept-ranges`, `cache-control`, `etag`, `last-modified`,
