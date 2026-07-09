@@ -185,8 +185,10 @@ Each resource may set `access.mode`:
 }
 ```
 
-`serviceTokenHeader` must not be a payment, hop-by-hop, `host`, or `content-length` header
-(validation rejects it). The token value is never logged and never appears in diagnostics or
+`serviceTokenHeader` must be a valid HTTP header name (RFC 9110 token — no whitespace) and must
+not be a payment, hop-by-hop, `host`, or `content-length` header; `serviceTokenValue` must not
+contain control characters (validation rejects all of these, and injection independently refuses
+them as defense in depth). The token value is never logged and never appears in diagnostics or
 discovery output.
 
 Responses always forward a safe default set (`content-type`, `content-disposition`,

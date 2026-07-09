@@ -64,6 +64,52 @@ describe("resourceStore", () => {
     );
   });
 
+  it("rejects placeholders in websocket upstream URLs, which are connected verbatim", () => {
+    const issues = validateX402Resource(
+      createResource({
+        kind: "websocket",
+        method: "GET",
+        publicPath: "/ws/[room]/feed",
+        upstreamUrl: "wss://upstream.example.com/feed/[room]",
+        stream: {
+          leasePath: "/ws/lease",
+          leaseSeconds: 60,
+          allowRenewal: false,
+          renewalWindowSeconds: 0,
+        },
+      }),
+    );
+
+    expect(issues.map((issue) => issue.reason)).toContain(
+      "websocket upstreamUrl must not contain placeholder [room]",
+    );
+  });
+
+  it("rejects invalid service-token header names and control characters in values", () => {
+    const badName = validateX402Resource(
+      createResource({
+        access: { mode: "service-token", serviceTokenHeader: "X Auth ", serviceTokenValue: "ok" },
+      }),
+    );
+    expect(badName.map((issue) => issue.reason)).toContain(
+      "access.serviceTokenHeader must be a valid HTTP header name (RFC 9110 token, no whitespace)",
+    );
+
+    const badValue = validateX402Resource(
+      createResource({
+        access: {
+          mode: "service-token",
+          serviceTokenHeader: "Authorization",
+          serviceTokenValue: "Bearer abc\r\nX-Injected: 1",
+        },
+      }),
+    );
+    expect(badValue.map((issue) => issue.reason)).toContain(
+      "access.serviceTokenValue must not contain control characters",
+    );
+    expect(JSON.stringify(badValue)).not.toContain("Bearer abc");
+  });
+
   it("validates service-token access configuration without leaking the token value", () => {
     const missingConfig = validateX402Resource(createResource({ access: { mode: "service-token" } }));
     expect(missingConfig.map((issue) => issue.reason)).toEqual(

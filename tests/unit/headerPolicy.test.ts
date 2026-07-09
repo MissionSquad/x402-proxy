@@ -112,6 +112,27 @@ describe("applyServiceTokenAccess", () => {
     expect(headers.get("authorization")).toBe("Bearer user-token");
     expect(headers.get("x-payment")).toBeNull();
   });
+
+  it("skips invalid header names and values without throwing (bypassed-validation defense)", () => {
+    const headers = new Headers({ authorization: "Bearer user-token" });
+    expect(() =>
+      applyServiceTokenAccess(headers, {
+        mode: "service-token",
+        serviceTokenHeader: "X Auth ",
+        serviceTokenValue: "ok",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      applyServiceTokenAccess(headers, {
+        mode: "service-token",
+        serviceTokenHeader: "x-service-auth",
+        serviceTokenValue: "abc\r\nx-injected: 1",
+      }),
+    ).not.toThrow();
+    expect(headers.get("authorization")).toBe("Bearer user-token");
+    expect(headers.get("x-service-auth")).toBeNull();
+    expect(headers.get("x-injected")).toBeNull();
+  });
 });
 
 describe("applyUpstreamResponseHeaders", () => {

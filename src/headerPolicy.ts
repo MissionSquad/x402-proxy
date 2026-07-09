@@ -88,6 +88,20 @@ const RESPONSE_PRESET_HEADERS: Record<X402HeaderPreset, string[]> = {
   streaming: ["content-type", "cache-control", "connection", "x-accel-buffering", "x-run-id"],
 };
 
+/** RFC 9110 field-name token: no whitespace, separators, or control characters. */
+const HEADER_NAME_TOKEN_REGEX = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/** CR, LF, and NUL in a field value enable header injection and make Headers.set throw. */
+const HEADER_VALUE_FORBIDDEN_REGEX = /[\r\n\0]/;
+
+export function isValidHttpHeaderName(name: string): boolean {
+  return HEADER_NAME_TOKEN_REGEX.test(name);
+}
+
+export function isValidHttpHeaderValue(value: string): boolean {
+  return !HEADER_VALUE_FORBIDDEN_REGEX.test(value);
+}
+
 export function shouldDropProxyHeader(name: string): boolean {
   const lower = name.toLowerCase();
   return (
@@ -181,15 +195,23 @@ export function applyUpstreamResponseHeaders(
 /**
  * Apply a resource's `service-token` access mode to the outbound upstream headers,
  * replacing any client-supplied value for the same header. Runs after the header
- * policy so the injected credential always wins. Payment/hop-by-hop header names are
- * refused here as defense in depth; resource validation already rejects them.
+ * policy so the injected credential always wins. Payment/hop-by-hop names, invalid
+ * header-name tokens, and values containing CR/LF/NUL are refused here as defense in
+ * depth (a custom resource store may bypass validateX402Resource; an invalid name or
+ * value would otherwise throw in Headers.set or enable header injection).
  */
 export function applyServiceTokenAccess(headers: Headers, access?: X402ResourceAccess): void {
   if (access?.mode !== "service-token") {
     return;
   }
   const { serviceTokenHeader, serviceTokenValue } = access;
-  if (!serviceTokenHeader || !serviceTokenValue || shouldDropProxyHeader(serviceTokenHeader.toLowerCase())) {
+  if (
+    !serviceTokenHeader ||
+    !serviceTokenValue ||
+    !isValidHttpHeaderName(serviceTokenHeader) ||
+    !isValidHttpHeaderValue(serviceTokenValue) ||
+    shouldDropProxyHeader(serviceTokenHeader.toLowerCase())
+  ) {
     return;
   }
   headers.set(serviceTokenHeader, serviceTokenValue);

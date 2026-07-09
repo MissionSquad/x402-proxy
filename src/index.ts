@@ -53,6 +53,8 @@ export {
   applyServiceTokenAccess,
   applyUpstreamResponseHeaders,
   createForwardHeaders,
+  isValidHttpHeaderName,
+  isValidHttpHeaderValue,
   shouldDropProxyHeader,
 } from "./headerPolicy";
 export {

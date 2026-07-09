@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { RouteBuildError, ValidationError } from "./errors";
-import { shouldDropProxyHeader } from "./headerPolicy";
+import { isValidHttpHeaderName, isValidHttpHeaderValue, shouldDropProxyHeader } from "./headerPolicy";
 import {
   extractRoutePlaceholders,
   findBestRouteMatch,
@@ -59,6 +59,15 @@ function validateUpstreamPlaceholders(resource: X402Resource, errors: string[]):
     return;
   }
 
+  // WebSocket upstream URLs are connected verbatim — no interpolation ever runs on them —
+  // so any placeholder is a misconfiguration that would reach the upstream literally.
+  if (resource.kind === "websocket") {
+    for (const placeholder of extractRoutePlaceholders(resource.upstreamUrl)) {
+      errors.push(`websocket upstreamUrl must not contain placeholder [${placeholder}]`);
+    }
+    return;
+  }
+
   const publicParams = new Set(publicPattern.paramNames);
   for (const placeholder of extractRoutePlaceholders(resource.upstreamUrl)) {
     if (!publicParams.has(placeholder)) {
@@ -68,11 +77,8 @@ function validateUpstreamPlaceholders(resource: X402Resource, errors: string[]):
 
   // Interpolation only substitutes placeholders occupying a full path segment; reject any
   // occurrence that would validate but never be substituted (partial segment, query, hash).
-  // WebSocket upstream URLs are connected verbatim, so the position rule applies to HTTP kinds.
-  if (resource.kind !== "websocket") {
-    for (const placeholder of findMisplacedUpstreamPlaceholders(resource.upstreamUrl) ?? []) {
-      errors.push(`upstreamUrl placeholder [${placeholder}] must occupy a full path segment`);
-    }
+  for (const placeholder of findMisplacedUpstreamPlaceholders(resource.upstreamUrl) ?? []) {
+    errors.push(`upstreamUrl placeholder [${placeholder}] must occupy a full path segment`);
   }
 }
 
@@ -89,11 +95,15 @@ function validateAccess(resource: X402Resource, errors: string[]): void {
   }
   if (!isNonEmptyString(resource.access.serviceTokenHeader)) {
     errors.push("access.serviceTokenHeader is required for service-token mode");
+  } else if (!isValidHttpHeaderName(resource.access.serviceTokenHeader)) {
+    errors.push("access.serviceTokenHeader must be a valid HTTP header name (RFC 9110 token, no whitespace)");
   } else if (shouldDropProxyHeader(resource.access.serviceTokenHeader.toLowerCase())) {
     errors.push("access.serviceTokenHeader must not be a payment, hop-by-hop, host, or content-length header");
   }
   if (!isNonEmptyString(resource.access.serviceTokenValue)) {
     errors.push("access.serviceTokenValue is required for service-token mode");
+  } else if (!isValidHttpHeaderValue(resource.access.serviceTokenValue)) {
+    errors.push("access.serviceTokenValue must not contain control characters");
   }
 }
 
