@@ -62,6 +62,16 @@ describe("resourceStore", () => {
     expect(queryPlaceholder.map((issue) => issue.reason)).toContain(
       "upstreamUrl placeholder [username] must occupy a full path segment",
     );
+
+    // Userinfo placeholders parse (percent-encoded) but are never interpolated.
+    const userinfoPlaceholder = validateX402Resource(
+      createResource({
+        upstreamUrl: "https://[username]@upstream.example.com/v1/[username]/[slug]/chat",
+      }),
+    );
+    expect(userinfoPlaceholder.map((issue) => issue.reason)).toContain(
+      "upstreamUrl placeholder [username] must occupy a full path segment",
+    );
   });
 
   it("rejects placeholders in websocket upstream URLs, which are connected verbatim", () => {

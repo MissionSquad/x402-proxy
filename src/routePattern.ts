@@ -206,9 +206,11 @@ export function extractRoutePlaceholders(value: string): string[] {
 
 /**
  * Placeholder occurrences in an upstream URL that interpolation will never substitute:
- * only `[name]` occupying a full path segment is interpolated, so any occurrence inside
- * a partial segment, the query string, or the fragment is misplaced and validation must
- * reject it up front. Returns null when the URL is invalid (reported separately).
+ * only `[name]` occupying a full path segment is interpolated. Rather than enumerating
+ * URL parts (partial segments, query, fragment, userinfo, ...), compare every raw
+ * occurrence against the occurrences interpolation will actually rewrite — any surplus
+ * occurrence is misplaced wherever it appears, so the check is complete by construction.
+ * Returns null when the URL is invalid (reported separately by URL validation).
  */
 export function findMisplacedUpstreamPlaceholders(upstreamUrl: string): string[] | null {
   let target: URL;
@@ -217,19 +219,27 @@ export function findMisplacedUpstreamPlaceholders(upstreamUrl: string): string[]
   } catch {
     return null;
   }
-  const misplaced = new Set<string>();
+
+  const rawCounts = new Map<string, number>();
+  for (const name of extractRoutePlaceholders(upstreamUrl)) {
+    rawCounts.set(name, (rawCounts.get(name) ?? 0) + 1);
+  }
+
+  const interpolatedCounts = new Map<string, number>();
   for (const segment of target.pathname.split("/")) {
-    if (PARAM_SEGMENT_REGEX.test(segment)) {
-      continue;
-    }
-    for (const name of extractRoutePlaceholders(segment)) {
-      misplaced.add(name);
+    const match = PARAM_SEGMENT_REGEX.exec(segment);
+    if (match && match[1]) {
+      interpolatedCounts.set(match[1], (interpolatedCounts.get(match[1]) ?? 0) + 1);
     }
   }
-  for (const name of extractRoutePlaceholders(`${target.search}${target.hash}`)) {
-    misplaced.add(name);
+
+  const misplaced: string[] = [];
+  for (const [name, count] of rawCounts) {
+    if (count > (interpolatedCounts.get(name) ?? 0)) {
+      misplaced.push(name);
+    }
   }
-  return [...misplaced];
+  return misplaced;
 }
 
 export function interpolateUpstreamUrl(
