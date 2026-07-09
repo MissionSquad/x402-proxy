@@ -399,6 +399,58 @@ describe("proxyStreamingHttpRequest", () => {
     expect(res.streamedBody).toBe("first");
   });
 
+  it("rethrows a non-abort relay failure even after the client disconnects", async () => {
+    let failSecond: () => void = () => undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(new TextEncoder().encode("first"));
+        failSecond = (): void => {
+          controller.error(new Error("reader exploded"));
+        };
+      },
+    });
+    fetchMock.mockResolvedValue(new Response(stream, { status: 200 }));
+    const req = createFakeRequest({ method: "POST" });
+    const promise = proxyStreamingHttpRequest({
+      target,
+      req: req as never,
+      res: new FakeResponse() as never,
+      securityConfig: { allowPrivateIpUpstreams: true },
+    });
+    await nextTick();
+    req.emit("close");
+    failSecond();
+    await expect(promise).rejects.toThrow("reader exploded");
+  });
+
+  it("swallows only the abort rejection after a client disconnect", async () => {
+    let abortSecond: () => void = () => undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(new TextEncoder().encode("first"));
+        abortSecond = (): void => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          controller.error(error);
+        };
+      },
+    });
+    fetchMock.mockResolvedValue(new Response(stream, { status: 200 }));
+    const req = createFakeRequest({ method: "POST" });
+    const res = new FakeResponse();
+    const promise = proxyStreamingHttpRequest({
+      target,
+      req: req as never,
+      res: res as never,
+      securityConfig: { allowPrivateIpUpstreams: true },
+    });
+    await nextTick();
+    req.emit("close");
+    abortSecond();
+    await expect(promise).resolves.toBeUndefined();
+    expect(res.streamedBody).toBe("first");
+  });
+
   it("rethrows a non-client-close fetch failure", async () => {
     fetchMock.mockRejectedValue(new Error("network down"));
     await expect(

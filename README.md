@@ -166,7 +166,7 @@ request/upstream response; explicit `addRequestHeaders`/`addResponseHeaders` val
 
 ### Upstream access modes
 
-Each resource may set `access.mode`:
+HTTP resources (`kind: "http"` and `kind: "http-stream"`) may set `access.mode`:
 
 - `pass-through` (default): client credentials reach the upstream only per the header policy above.
 - `service-token`: the proxy injects `access.serviceTokenHeader: access.serviceTokenValue` on the
@@ -189,7 +189,8 @@ Each resource may set `access.mode`:
 not be a payment, hop-by-hop, `host`, or `content-length` header; `serviceTokenValue` must not
 contain control characters (validation rejects all of these, and injection independently refuses
 them as defense in depth). The token value is never logged and never appears in diagnostics or
-discovery output.
+discovery output. WebSocket resources are relayed without header forwarding or injection, so
+`service-token` does not apply to them and validation rejects the combination.
 
 Responses always forward a safe default set (`content-type`, `content-disposition`,
 `content-language`, `content-range`, `accept-ranges`, `cache-control`, `etag`, `last-modified`,

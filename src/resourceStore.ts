@@ -93,6 +93,11 @@ function validateAccess(resource: X402Resource, errors: string[]): void {
   if (resource.access.mode !== "service-token") {
     return;
   }
+  // The WebSocket gateway relays connections without header forwarding or injection,
+  // so a service token configured on a websocket resource would never be applied.
+  if (resource.kind === "websocket") {
+    errors.push("access.mode service-token is not supported for websocket resources");
+  }
   if (!isNonEmptyString(resource.access.serviceTokenHeader)) {
     errors.push("access.serviceTokenHeader is required for service-token mode");
   } else if (!isValidHttpHeaderName(resource.access.serviceTokenHeader)) {

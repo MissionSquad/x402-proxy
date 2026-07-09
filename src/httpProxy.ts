@@ -264,6 +264,14 @@ function createInterpolatedTargetUrl(
   );
 }
 
+/**
+ * Shape-based AbortError check: undici rejects aborted fetches/reads with a DOMException
+ * named "AbortError", which is not an `instanceof Error` on every Node version.
+ */
+function isAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError";
+}
+
 function toAbortErrorResponse(targetId: string): UpstreamTimeoutError {
   return new UpstreamTimeoutError("Upstream request timed out", {
     endpointId: targetId,
@@ -369,7 +377,8 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
     response = await fetch(targetUrl, requestInit);
   } catch (error: unknown) {
     // A client disconnect aborts the shared controller; there is nothing left to send.
-    if (clientClosed) {
+    // Swallow only the resulting abort rejection — any other failure is a real error.
+    if (clientClosed && isAbortError(error)) {
       return;
     }
     throw error;
@@ -419,9 +428,11 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
       input.res.end();
     }
   } catch (error: unknown) {
-    // Aborting the upstream fetch after a client disconnect rejects the pending read;
-    // there is no one left to answer, so swallow only that case.
-    if (!clientClosed) {
+    // Aborting the upstream fetch after a client disconnect rejects the pending read
+    // with an AbortError; there is no one left to answer, so swallow only that case.
+    // Any other failure is a real relay error and must propagate even if the client
+    // is gone, so it stays visible to host-level error handling.
+    if (!(clientClosed && isAbortError(error))) {
       throw error;
     }
   } finally {

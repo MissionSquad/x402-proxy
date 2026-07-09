@@ -85,6 +85,28 @@ describe("resourceStore", () => {
     );
   });
 
+  it("rejects service-token mode on websocket resources", () => {
+    const issues = validateX402Resource(
+      createResource({
+        kind: "websocket",
+        method: "GET",
+        publicPath: "/ws/feed",
+        upstreamUrl: "wss://upstream.example.com/feed",
+        access: { mode: "service-token", serviceTokenHeader: "Authorization", serviceTokenValue: "Bearer svc" },
+        stream: {
+          leasePath: "/ws/lease",
+          leaseSeconds: 60,
+          allowRenewal: false,
+          renewalWindowSeconds: 0,
+        },
+      }),
+    );
+
+    expect(issues.map((issue) => issue.reason)).toContain(
+      "access.mode service-token is not supported for websocket resources",
+    );
+  });
+
   it("rejects invalid service-token header names and control characters in values", () => {
     const badName = validateX402Resource(
       createResource({
