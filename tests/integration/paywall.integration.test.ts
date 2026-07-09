@@ -68,7 +68,7 @@ describe("browser paywall rendering", () => {
   });
 
   describe("with a custom paywall provider", () => {
-    const generateHtmlCalls: Array<{ paymentRequired: PaymentRequired; config?: PaywallConfig }> = [];
+    const generateHtmlCalls: Array<{ paymentRequired: PaymentRequired; config: PaywallConfig | undefined }> = [];
     const stubPaywall: PaywallProvider = {
       generateHtml(paymentRequired, config) {
         generateHtmlCalls.push({ paymentRequired, config });
@@ -137,7 +137,7 @@ describe("browser paywall rendering", () => {
   });
 
   describe("testnet derivation for testnet networks", () => {
-    const generateHtmlCalls: Array<{ config?: PaywallConfig }> = [];
+    const generateHtmlCalls: Array<{ config: PaywallConfig | undefined }> = [];
     const stubPaywall: PaywallProvider = {
       generateHtml(_paymentRequired, config) {
         generateHtmlCalls.push({ config });
