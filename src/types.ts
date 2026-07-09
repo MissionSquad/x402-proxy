@@ -1,4 +1,4 @@
-import type { RouteConfig } from "@x402/core/server";
+import type { PaywallConfig, PaywallProvider, RouteConfig } from "@x402/core/server";
 import type { Network } from "@x402/core/types";
 import type { Express, RequestHandler } from "express";
 
@@ -208,6 +208,20 @@ export type X402ProxySdkConfig = {
   discovery?: DiscoveryConfig;
   security?: SecurityConfig;
   syncFacilitatorOnStart?: boolean;
+  /**
+   * Optional paywall provider that renders the full wallet-connect payment UI for
+   * browser requests hitting protected endpoints (e.g. from @x402/paywall:
+   * `createPaywall().withNetwork(evmPaywall).build()`). Without it, browsers get
+   * the basic built-in "Payment Required" page.
+   */
+  paywall?: PaywallProvider;
+  /**
+   * Customization for the browser paywall (app name/logo, testnet chain selection).
+   * When `testnet` is not set it is derived from `defaultNetwork` (known testnets
+   * only) instead of inheriting @x402/core's default of `true`, which would point
+   * mainnet deployments at testnet chains.
+   */
+  paywallConfig?: PaywallConfig;
 };
 
 /**

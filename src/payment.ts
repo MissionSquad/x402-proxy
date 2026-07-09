@@ -1,5 +1,5 @@
 import { paymentMiddleware } from "@x402/express";
-import type { RoutesConfig, x402ResourceServer } from "@x402/core/server";
+import type { PaywallConfig, PaywallProvider, RoutesConfig, x402ResourceServer } from "@x402/core/server";
 import type { RequestHandler } from "express";
 
 /**
@@ -9,6 +9,8 @@ export function createPaymentMiddleware(
   routes: RoutesConfig,
   server: x402ResourceServer,
   syncFacilitatorOnStart: boolean,
+  paywallConfig?: PaywallConfig,
+  paywall?: PaywallProvider,
 ): RequestHandler {
-  return paymentMiddleware(routes, server, undefined, undefined, syncFacilitatorOnStart);
+  return paymentMiddleware(routes, server, paywallConfig, paywall, syncFacilitatorOnStart);
 }

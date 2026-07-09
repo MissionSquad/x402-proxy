@@ -1,3 +1,4 @@
+import type { PaywallConfig } from "@x402/core/server";
 import type { Network, Price } from "@x402/core/types";
 import type { Express } from "express";
 
@@ -132,6 +133,20 @@ function buildRouteInputs(
 }
 
 /**
+ * Networks whose browser paywall should run in testnet mode. @x402/core defaults the
+ * paywall to testnet when unspecified, which silently points mainnet deployments at
+ * testnet chains — derive the flag from the configured network instead.
+ */
+const TESTNET_NETWORKS = new Set<string>(["eip155:84532", "eip155:11155111"]);
+
+function resolvePaywallConfig(config: X402ProxySdkConfig): PaywallConfig {
+  return {
+    ...config.paywallConfig,
+    testnet: config.paywallConfig?.testnet ?? TESTNET_NETWORKS.has(config.defaultNetwork),
+  };
+}
+
+/**
  * Create configured x402 proxy SDK instance.
  */
 export function createX402ProxySdk(config: X402ProxySdkConfig): X402ProxySdk {
@@ -142,8 +157,15 @@ export function createX402ProxySdk(config: X402ProxySdkConfig): X402ProxySdk {
   const routeInputs = buildRouteInputs(config, resolvedEndpoints);
   const routes = buildRoutes(routeInputs);
 
+  const paywallConfig = resolvePaywallConfig(config);
   const server = createResourceServer(config.facilitator?.url, config.facilitator?.authorizationBearer);
-  const paymentMiddleware = createPaymentMiddleware(routes, server, config.syncFacilitatorOnStart ?? true);
+  const paymentMiddleware = createPaymentMiddleware(
+    routes,
+    server,
+    config.syncFacilitatorOnStart ?? true,
+    paywallConfig,
+    config.paywall,
+  );
   const staticResources = configuredEndpoints.map((endpoint) =>
     endpointToResource(endpoint, { network: config.defaultNetwork, payTo: config.defaultPayTo }),
   );
@@ -154,7 +176,11 @@ export function createX402ProxySdk(config: X402ProxySdkConfig): X402ProxySdk {
     leaseTokenSecret: config.leaseTokenSecret,
     syncFacilitatorOnStart: config.syncFacilitatorOnStart ?? true,
     requireProtectedResources: config.requireProtectedResources ?? true,
+    paywallConfig,
   };
+  if (config.paywall) {
+    runtimeInput.paywall = config.paywall;
+  }
   if (config.security) {
     runtimeInput.security = config.security;
   }
