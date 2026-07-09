@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  applyServiceTokenAccess,
   applyUpstreamResponseHeaders,
   createForwardHeaders,
   shouldDropProxyHeader,
@@ -48,13 +49,34 @@ describe("headerPolicy", () => {
     expect(shouldDropProxyHeader("x-payment")).toBe(true);
   });
 
-  it("forwards the x-webhook-secret auth header under the api-auth preset", () => {
-    const req = { headers: { "x-webhook-secret": "shhh", "x-request-id": "abc" } };
-    const headers = createForwardHeaders(req as unknown as Parameters<typeof createForwardHeaders>[0], {
+  it("limits presets to the spec-exact lists; extras require explicit forwardRequestHeaders", () => {
+    const req = { headers: { "x-webhook-secret": "shhh", "x-request-id": "abc", accept: "*/*" } };
+    const presetOnly = createForwardHeaders(req as unknown as Parameters<typeof createForwardHeaders>[0], {
       presets: ["api-auth"],
     });
-    expect(headers.get("x-webhook-secret")).toBe("shhh");
-    expect(headers.get("x-request-id")).toBe("abc");
+    expect(presetOnly.get("x-webhook-secret")).toBeNull();
+    expect(presetOnly.get("x-request-id")).toBeNull();
+    expect(presetOnly.get("accept")).toBe("*/*");
+
+    const extended = createForwardHeaders(req as unknown as Parameters<typeof createForwardHeaders>[0], {
+      presets: ["api-auth"],
+      forwardRequestHeaders: ["x-webhook-secret", "x-request-id"],
+    });
+    expect(extended.get("x-webhook-secret")).toBe("shhh");
+    expect(extended.get("x-request-id")).toBe("abc");
+  });
+
+  it("excludes preset-granted request headers via excludeRequestHeaders", () => {
+    const req = {
+      headers: { cookie: "session=1", authorization: "Bearer secret", accept: "*/*" },
+    };
+    const headers = createForwardHeaders(req as unknown as Parameters<typeof createForwardHeaders>[0], {
+      presets: ["browser-auth"],
+      excludeRequestHeaders: ["Cookie"],
+    });
+    expect(headers.get("cookie")).toBeNull();
+    expect(headers.get("authorization")).toBe("Bearer secret");
+    expect(headers.get("accept")).toBe("*/*");
   });
 
   it("joins array-valued request headers", () => {
@@ -63,6 +85,32 @@ describe("headerPolicy", () => {
       presets: ["api-auth"],
     });
     expect(headers.get("x-api-key")).toBe("a, b");
+  });
+});
+
+describe("applyServiceTokenAccess", () => {
+  it("injects the service token, replacing any client-forwarded value", () => {
+    const headers = new Headers({ authorization: "Bearer user-token" });
+    applyServiceTokenAccess(headers, {
+      mode: "service-token",
+      serviceTokenHeader: "Authorization",
+      serviceTokenValue: "Bearer service-token",
+    });
+    expect(headers.get("authorization")).toBe("Bearer service-token");
+  });
+
+  it("does nothing for pass-through, missing config, or protected header names", () => {
+    const headers = new Headers({ authorization: "Bearer user-token" });
+    applyServiceTokenAccess(headers, { mode: "pass-through" });
+    applyServiceTokenAccess(headers, { mode: "service-token" });
+    applyServiceTokenAccess(headers, {
+      mode: "service-token",
+      serviceTokenHeader: "x-payment",
+      serviceTokenValue: "leak",
+    });
+    applyServiceTokenAccess(headers, undefined);
+    expect(headers.get("authorization")).toBe("Bearer user-token");
+    expect(headers.get("x-payment")).toBeNull();
   });
 });
 
@@ -98,6 +146,17 @@ describe("applyUpstreamResponseHeaders", () => {
     expect(res.headers["content-length"]).toBeUndefined();
     expect(res.headers["connection"]).toBeUndefined();
     expect(res.headers["content-type"]).toBe("application/json");
+  });
+
+  it("excludes default-forwarded response headers via excludeResponseHeaders", () => {
+    const res = new FakeResponse();
+    applyUpstreamResponseHeaders(
+      res as never,
+      upstream({ "content-type": "application/json", etag: 'W/"1"' }),
+      { excludeResponseHeaders: ["ETag"] },
+    );
+    expect(res.headers["content-type"]).toBe("application/json");
+    expect(res.headers["etag"]).toBeUndefined();
   });
 
   it("honors forwardResponseHeaders and addResponseHeaders, dropping protected additions", () => {

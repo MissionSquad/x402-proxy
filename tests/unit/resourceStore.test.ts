@@ -44,6 +44,56 @@ describe("resourceStore", () => {
     );
   });
 
+  it("rejects upstream placeholders that do not occupy a full path segment", () => {
+    const partialSegment = validateX402Resource(
+      createResource({
+        upstreamUrl: "https://upstream.example.com/v1/user-[username]/[slug]/chat",
+      }),
+    );
+    expect(partialSegment.map((issue) => issue.reason)).toContain(
+      "upstreamUrl placeholder [username] must occupy a full path segment",
+    );
+
+    const queryPlaceholder = validateX402Resource(
+      createResource({
+        upstreamUrl: "https://upstream.example.com/v1/[username]/[slug]/chat?user=[username]",
+      }),
+    );
+    expect(queryPlaceholder.map((issue) => issue.reason)).toContain(
+      "upstreamUrl placeholder [username] must occupy a full path segment",
+    );
+  });
+
+  it("validates service-token access configuration without leaking the token value", () => {
+    const missingConfig = validateX402Resource(createResource({ access: { mode: "service-token" } }));
+    expect(missingConfig.map((issue) => issue.reason)).toEqual(
+      expect.arrayContaining([
+        "access.serviceTokenHeader is required for service-token mode",
+        "access.serviceTokenValue is required for service-token mode",
+      ]),
+    );
+
+    const protectedHeader = validateX402Resource(
+      createResource({
+        access: { mode: "service-token", serviceTokenHeader: "X-Payment", serviceTokenValue: "topsecret" },
+      }),
+    );
+    expect(protectedHeader.map((issue) => issue.reason)).toContain(
+      "access.serviceTokenHeader must not be a payment, hop-by-hop, host, or content-length header",
+    );
+    expect(JSON.stringify(protectedHeader)).not.toContain("topsecret");
+
+    const valid = validateX402Resource(
+      createResource({
+        access: { mode: "service-token", serviceTokenHeader: "Authorization", serviceTokenValue: "Bearer svc" },
+      }),
+    );
+    expect(valid).toEqual([]);
+
+    const passThrough = validateX402Resource(createResource({ access: { mode: "pass-through" } }));
+    expect(passThrough).toEqual([]);
+  });
+
   it("matches in-memory resources by dynamic path", async () => {
     const store = new InMemoryX402ResourceStore([createResource()]);
     const resource = await store.getResourceForRequest("POST", "/paid/agents/jayson/research/chat");

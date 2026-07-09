@@ -9,9 +9,15 @@ import {
   UpstreamRequestError,
   UpstreamTimeoutError,
 } from "./errors";
-import { applyUpstreamResponseHeaders, createForwardHeaders } from "./headerPolicy";
+import { applyServiceTokenAccess, applyUpstreamResponseHeaders, createForwardHeaders } from "./headerPolicy";
 import { interpolateUpstreamUrl } from "./routePattern";
-import type { HttpMethod, HttpProxyEndpointConfig, SecurityConfig, X402HeaderPolicy } from "./types";
+import type {
+  HttpMethod,
+  HttpProxyEndpointConfig,
+  SecurityConfig,
+  X402HeaderPolicy,
+  X402ResourceAccess,
+} from "./types";
 
 const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
@@ -159,6 +165,7 @@ export type HttpProxyResourceTarget = {
   method: HttpMethod;
   upstreamUrl: string;
   headers?: X402HeaderPolicy;
+  access?: X402ResourceAccess;
   maxTimeoutSeconds?: number;
 };
 
@@ -279,6 +286,7 @@ export async function proxyBufferedHttpRequest(input: ProxyHttpRequestInput): Pr
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   const headers = createForwardHeaders(input.req, input.target.headers);
+  applyServiceTokenAccess(headers, input.target.access);
   const requestInit: RequestInit = {
     method: input.req.method,
     headers,
@@ -329,12 +337,23 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let clientClosed = false;
-  input.req.on("close", () => {
+  const abortForClientDisconnect = (): void => {
     clientClosed = true;
     controller.abort();
+  };
+  // In Node 20+, a server IncomingMessage does not reliably emit "close" when the client
+  // aborts mid-response; the response's "close" (fired on premature connection termination)
+  // is the dependable signal. Keep the request listener for request-side terminations and
+  // guard on writableEnded so a naturally completed response never aborts anything.
+  input.req.on("close", abortForClientDisconnect);
+  input.res.on("close", () => {
+    if (!input.res.writableEnded) {
+      abortForClientDisconnect();
+    }
   });
 
   const headers = createForwardHeaders(input.req, input.target.headers);
+  applyServiceTokenAccess(headers, input.target.access);
   const requestInit: RequestInit = {
     method: input.req.method,
     headers,
@@ -382,16 +401,24 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
         await new Promise<void>((resolve) => {
           const settle = (): void => {
             input.res.off("drain", settle);
+            input.res.off("close", settle);
             input.req.off("close", settle);
             resolve();
           };
           input.res.once("drain", settle);
+          input.res.once("close", settle);
           input.req.once("close", settle);
         });
       }
     }
     if (!input.res.writableEnded) {
       input.res.end();
+    }
+  } catch (error: unknown) {
+    // Aborting the upstream fetch after a client disconnect rejects the pending read;
+    // there is no one left to answer, so swallow only that case.
+    if (!clientClosed) {
+      throw error;
     }
   } finally {
     reader.releaseLock();

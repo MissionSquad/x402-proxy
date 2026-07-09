@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
 
-import type { X402HeaderPolicy, X402HeaderPreset } from "./types";
+import type { X402HeaderPolicy, X402HeaderPreset, X402ResourceAccess } from "./types";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -22,31 +22,30 @@ const INTERNAL_PAYMENT_HEADERS = new Set([
   "x-x402-lease",
 ]);
 
+/**
+ * Preset request-header allowlists. These match the x402-proxy expansion spec exactly;
+ * anything beyond them (x-request-id, idempotency-key, webhook secrets, ...) must be
+ * opted into per resource via `forwardRequestHeaders`.
+ */
 const REQUEST_PRESET_HEADERS: Record<X402HeaderPreset, string[]> = {
   none: [],
   "api-auth": [
     "authorization",
     "x-api-key",
-    "x-webhook-secret",
     "content-type",
     "accept",
-    "accept-language",
     "user-agent",
     "x-client-id",
     "x-session-id",
-    "x-request-id",
-    "idempotency-key",
   ],
   "browser-auth": [
     "cookie",
     "authorization",
     "content-type",
     "accept",
-    "accept-language",
     "user-agent",
     "x-client-id",
     "x-session-id",
-    "x-request-id",
   ],
   streaming: [],
 };
@@ -121,11 +120,12 @@ export function createForwardHeaders(req: Request, policy?: X402HeaderPolicy): H
   for (const header of normalizeHeaderList(policy?.forwardRequestHeaders)) {
     allowed.add(header);
   }
+  const excluded = normalizeHeaderList(policy?.excludeRequestHeaders);
 
   const headers = new Headers();
   for (const [headerName, headerValue] of Object.entries(req.headers)) {
     const lower = headerName.toLowerCase();
-    if (!allowed.has(lower) || shouldDropProxyHeader(lower)) {
+    if (!allowed.has(lower) || excluded.has(lower) || shouldDropProxyHeader(lower)) {
       continue;
     }
     if (headerValue === undefined) {
@@ -157,13 +157,14 @@ export function applyUpstreamResponseHeaders(
   for (const header of normalizeHeaderList(policy?.forwardResponseHeaders)) {
     allowed.add(header);
   }
+  const excluded = normalizeHeaderList(policy?.excludeResponseHeaders);
 
   for (const [headerName, headerValue] of upstreamResponse.headers.entries()) {
     const lower = headerName.toLowerCase();
     if (MANAGED_RESPONSE_HEADERS.has(lower)) {
       continue;
     }
-    if (!allowed.has(lower) || shouldDropProxyHeader(lower)) {
+    if (!allowed.has(lower) || excluded.has(lower) || shouldDropProxyHeader(lower)) {
       continue;
     }
     res.setHeader(headerName, headerValue);
@@ -175,4 +176,21 @@ export function applyUpstreamResponseHeaders(
     }
     res.setHeader(headerName, headerValue);
   }
+}
+
+/**
+ * Apply a resource's `service-token` access mode to the outbound upstream headers,
+ * replacing any client-supplied value for the same header. Runs after the header
+ * policy so the injected credential always wins. Payment/hop-by-hop header names are
+ * refused here as defense in depth; resource validation already rejects them.
+ */
+export function applyServiceTokenAccess(headers: Headers, access?: X402ResourceAccess): void {
+  if (access?.mode !== "service-token") {
+    return;
+  }
+  const { serviceTokenHeader, serviceTokenValue } = access;
+  if (!serviceTokenHeader || !serviceTokenValue || shouldDropProxyHeader(serviceTokenHeader.toLowerCase())) {
+    return;
+  }
+  headers.set(serviceTokenHeader, serviceTokenValue);
 }

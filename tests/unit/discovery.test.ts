@@ -89,6 +89,41 @@ describe("createDiscoveryDocumentFromResources", () => {
     expect(doc.ownershipProofs).toBeUndefined();
     expect(doc.instructions).toBeUndefined();
   });
+
+  it("emits lease endpoints for http-stream and websocket resources, never raw stream paths or upstream URLs", () => {
+    const streamResource: X402LoadedResource = {
+      id: "s",
+      kind: "http-stream",
+      method: "POST",
+      publicPath: "/paid/agents/[username]/[slug]/chat",
+      paymentPath: "/paid/agents/[username]/[slug]/chat/lease",
+      upstreamUrl: "https://upstream.test/chat",
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const wsResource: X402LoadedResource = {
+      id: "w",
+      kind: "websocket",
+      method: "GET",
+      publicPath: "/ws/feed",
+      paymentPath: "/ws/lease",
+      upstreamUrl: "wss://upstream.test/feed",
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+
+    const doc = createDiscoveryDocumentFromResources(discovery, [streamResource, wsResource]);
+    expect(doc.resources).toEqual([
+      "https://api.example.com/paid/agents/[username]/[slug]/chat/lease",
+      "https://api.example.com/ws/lease",
+    ]);
+    const serialized = JSON.stringify(doc);
+    expect(serialized).not.toContain("upstream.test");
+    expect(serialized).not.toContain("/paid/agents/[username]/[slug]/chat\"");
+    expect(serialized).not.toContain("/ws/feed");
+  });
 });
 
 describe("createDiscoveryHandler", () => {

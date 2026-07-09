@@ -19,6 +19,7 @@ export type {
   X402ProxySdk,
   X402ProxySdkConfig,
   X402Resource,
+  X402ResourceAccess,
   X402ResourceKind,
   X402ResourceRefreshResult,
   X402ResourceStore,
@@ -49,6 +50,7 @@ export {
   webSocketGatewayEndpointsFromResources,
 } from "./wsGateway";
 export {
+  applyServiceTokenAccess,
   applyUpstreamResponseHeaders,
   createForwardHeaders,
   shouldDropProxyHeader,
@@ -72,7 +74,9 @@ export {
   validateX402Resource,
 } from "./resourceStore";
 export {
+  extractRoutePlaceholders,
   findBestRouteMatch,
+  findMisplacedUpstreamPlaceholders,
   interpolateUpstreamUrl,
   matchRoutePattern,
   parseRoutePattern,

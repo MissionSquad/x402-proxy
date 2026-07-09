@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import { RouteBuildError, ValidationError } from "./errors";
+import { shouldDropProxyHeader } from "./headerPolicy";
 import {
   extractRoutePlaceholders,
   findBestRouteMatch,
+  findMisplacedUpstreamPlaceholders,
   parseRoutePattern,
   type CompiledRoutePattern,
 } from "./routePattern";
@@ -63,6 +65,36 @@ function validateUpstreamPlaceholders(resource: X402Resource, errors: string[]):
       errors.push(`upstreamUrl placeholder [${placeholder}] is not present in publicPath`);
     }
   }
+
+  // Interpolation only substitutes placeholders occupying a full path segment; reject any
+  // occurrence that would validate but never be substituted (partial segment, query, hash).
+  // WebSocket upstream URLs are connected verbatim, so the position rule applies to HTTP kinds.
+  if (resource.kind !== "websocket") {
+    for (const placeholder of findMisplacedUpstreamPlaceholders(resource.upstreamUrl) ?? []) {
+      errors.push(`upstreamUrl placeholder [${placeholder}] must occupy a full path segment`);
+    }
+  }
+}
+
+function validateAccess(resource: X402Resource, errors: string[]): void {
+  if (!resource.access) {
+    return;
+  }
+  if (!["pass-through", "service-token"].includes(resource.access.mode)) {
+    errors.push("access.mode must be pass-through or service-token");
+    return;
+  }
+  if (resource.access.mode !== "service-token") {
+    return;
+  }
+  if (!isNonEmptyString(resource.access.serviceTokenHeader)) {
+    errors.push("access.serviceTokenHeader is required for service-token mode");
+  } else if (shouldDropProxyHeader(resource.access.serviceTokenHeader.toLowerCase())) {
+    errors.push("access.serviceTokenHeader must not be a payment, hop-by-hop, host, or content-length header");
+  }
+  if (!isNonEmptyString(resource.access.serviceTokenValue)) {
+    errors.push("access.serviceTokenValue is required for service-token mode");
+  }
 }
 
 export function validateX402Resource(resource: X402Resource): X402ResourceValidationIssue[] {
@@ -120,6 +152,7 @@ export function validateX402Resource(resource: X402Resource): X402ResourceValida
   }
 
   validateUpstreamPlaceholders(resource, errors);
+  validateAccess(resource, errors);
 
   return errors.map((reason) => ({ resourceId: resource.id || "unknown", reason }));
 }
