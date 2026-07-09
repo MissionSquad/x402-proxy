@@ -60,6 +60,7 @@ export {
 export {
   assertUpstreamAllowed,
   createHttpProxyHandler,
+  isAbortError,
   proxyBufferedHttpRequest,
   proxyStreamingHttpRequest,
   sendBufferedProxyResponse,

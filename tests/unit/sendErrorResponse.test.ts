@@ -38,6 +38,13 @@ describe("sendProxyErrorResponse", () => {
     expect((res.body as { code: string }).code).toBe("UPSTREAM_TIMEOUT_ERROR");
   });
 
+  it("maps a DOMException-shaped abort (not instanceof Error) to 504", () => {
+    const res = new FakeResponse();
+    sendProxyErrorResponse(res as never, { name: "AbortError", message: "This operation was aborted" });
+    expect(res.statusCode).toBe(504);
+    expect((res.body as { code: string }).code).toBe("UPSTREAM_TIMEOUT_ERROR");
+  });
+
   it("maps an unknown error to a generic 500 with no detail", () => {
     const res = new FakeResponse();
     sendProxyErrorResponse(res as never, new Error("kaboom"));

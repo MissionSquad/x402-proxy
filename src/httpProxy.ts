@@ -268,7 +268,7 @@ function createInterpolatedTargetUrl(
  * Shape-based AbortError check: undici rejects aborted fetches/reads with a DOMException
  * named "AbortError", which is not an `instanceof Error` on every Node version.
  */
-function isAbortError(error: unknown): boolean {
+export function isAbortError(error: unknown): boolean {
   return typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError";
 }
 
@@ -494,7 +494,7 @@ export function createHttpProxyHandler(
         res.status(413).json({ error: error.message, code: error.code });
         return;
       }
-      if (error instanceof Error && error.name === "AbortError") {
+      if (isAbortError(error)) {
         const timeoutError = toAbortErrorResponse(endpoint.id);
         res.status(504).json({ error: timeoutError.message, code: timeoutError.code });
         return;

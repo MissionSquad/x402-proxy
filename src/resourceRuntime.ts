@@ -20,6 +20,7 @@ import {
   X402ProxyError,
 } from "./errors";
 import {
+  isAbortError,
   proxyBufferedHttpRequest,
   proxyStreamingHttpRequest,
   sendBufferedProxyResponse,
@@ -244,7 +245,7 @@ export function sendProxyErrorResponse(res: Response, error: unknown): void {
     res.status(413).json({ error: error.message, code: error.code });
     return;
   }
-  if (error instanceof Error && error.name === "AbortError") {
+  if (isAbortError(error)) {
     res.status(504).json({ error: "Upstream request timed out", code: "UPSTREAM_TIMEOUT_ERROR" });
     return;
   }
