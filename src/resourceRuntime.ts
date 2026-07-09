@@ -1,5 +1,11 @@
 import { ExpressAdapter } from "@x402/express";
-import { x402HTTPResourceServer, type HTTPProcessResult, type RouteConfig } from "@x402/core/server";
+import {
+  x402HTTPResourceServer,
+  type HTTPProcessResult,
+  type PaywallConfig,
+  type PaywallProvider,
+  type RouteConfig,
+} from "@x402/core/server";
 import type { PaymentRequirements, PaymentPayload, Network } from "@x402/core/types";
 import type { Express, Request, RequestHandler, Response } from "express";
 
@@ -68,6 +74,8 @@ export type X402ResourceRuntimeOptions = {
   accessEventStore?: X402AccessEventStore;
   leaseUseStore?: X402LeaseUseStore;
   initialResources?: X402Resource[];
+  paywall?: PaywallProvider;
+  paywallConfig?: PaywallConfig;
 };
 
 type PaymentVerifiedResult = Extract<HTTPProcessResult, { type: "payment-verified" }>;
@@ -280,6 +288,10 @@ export class X402ResourceRuntime {
 
   private readonly facilitatorUrl: string | undefined;
 
+  private readonly paywall: PaywallProvider | undefined;
+
+  private readonly paywallConfig: PaywallConfig | undefined;
+
   private loaded: LoadedResourceInternal[] = [];
 
   private invalid: X402ResourceValidationIssue[] = [];
@@ -301,6 +313,10 @@ export class X402ResourceRuntime {
     this.syncFacilitatorOnStart = options.syncFacilitatorOnStart;
     this.requireProtectedResources = options.requireProtectedResources;
     this.facilitatorUrl = options.facilitatorUrl;
+    // Must be assigned before loadResources below — it registers the provider on the
+    // freshly created HTTP server.
+    this.paywall = options.paywall;
+    this.paywallConfig = options.paywallConfig;
     if (options.initialResources) {
       this.loadResources(options.initialResources, Date.now());
     }
@@ -349,6 +365,11 @@ export class X402ResourceRuntime {
     this.invalid = invalid;
     this.lastRefreshAt = refreshedAt;
     this.httpServer = new x402HTTPResourceServer(this.resourceServer, routes);
+    if (this.paywall) {
+      // The HTTP server is recreated on every resource refresh, so the paywall
+      // provider must be re-registered each time.
+      this.httpServer.registerPaywallProvider(this.paywall);
+    }
     this.initPromise = this.syncFacilitatorOnStart ? this.httpServer.initialize() : null;
 
     return {
@@ -438,7 +459,7 @@ export class X402ResourceRuntime {
     }
 
     await this.ensureInitialized();
-    const result = await httpServer.processHTTPRequest(context);
+    const result = await httpServer.processHTTPRequest(context, this.paywallConfig);
     if (result.type === "no-payment-required") {
       return null;
     }
