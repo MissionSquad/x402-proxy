@@ -118,8 +118,8 @@ export function validateX402Resource(resource: X402Resource): X402ResourceValida
   if (!isNonEmptyString(resource.id)) {
     errors.push("id must be a non-empty string");
   }
-  if (!["http", "http-stream", "websocket"].includes(resource.kind)) {
-    errors.push("kind must be http, http-stream, or websocket");
+  if (!["http", "http-stream", "http-stream-direct", "websocket"].includes(resource.kind)) {
+    errors.push("kind must be http, http-stream, http-stream-direct, or websocket");
   }
   if (!METHODS.includes(resource.method)) {
     errors.push("method is not supported");
@@ -143,6 +143,22 @@ export function validateX402Resource(resource: X402Resource): X402ResourceValida
   }
   if (!isNonEmptyString(resource.pricing.payTo)) {
     errors.push("pricing.payTo must be a non-empty string");
+  }
+
+  if (resource.kind === "http-stream-direct" && resource.stream) {
+    errors.push("stream config is not applicable to http-stream-direct resources (payment settles on the request itself; there is no lease)");
+  }
+
+  if (resource.match !== undefined) {
+    if (resource.kind !== "http" && resource.kind !== "http-stream-direct") {
+      errors.push("match is only supported on http and http-stream-direct resources");
+    }
+    if (!isNonEmptyString(resource.match.bodyField)) {
+      errors.push("match.bodyField must be a non-empty string");
+    }
+    if (!isNonEmptyString(resource.match.equals)) {
+      errors.push("match.equals must be a non-empty string");
+    }
   }
 
   if (resource.kind === "http-stream" || resource.kind === "websocket") {
@@ -201,7 +217,11 @@ export class InMemoryX402ResourceStore implements X402ResourceStore {
       .filter((resource) => resource.enabled)
       .map((resource) => {
         const indexed = createIndexedResource(resource);
-        const routeKey = `${indexed.method} ${indexed.routePattern.pattern}`;
+        // Body-matched resources may legitimately share a publicPath; their claim is
+        // path + discriminator value. Unmatched resources claim the whole path.
+        const routeKey = resource.match
+          ? `${indexed.method} ${indexed.routePattern.pattern} [${resource.match.bodyField}=${resource.match.equals}]`
+          : `${indexed.method} ${indexed.routePattern.pattern}`;
         if (seenRoutes.has(routeKey)) {
           throw new RouteBuildError("Duplicate resource route", { routeKey });
         }

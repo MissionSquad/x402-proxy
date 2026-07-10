@@ -64,8 +64,9 @@ export function createFacilitatorApp(controls: FacilitatorControls): Express {
 export async function readPaymentRequirement(
   url: string,
   method: "GET" | "POST" = "GET",
+  init?: Pick<RequestInit, "body" | "headers">,
 ): Promise<{ paymentRequired: PaymentRequired; accepted: PaymentRequirements }> {
-  const response = await fetch(url, { method });
+  const response = await fetch(url, { method, ...init });
   expect(response.status).toBe(402);
   const encoded = response.headers.get("payment-required");
   if (!encoded) {

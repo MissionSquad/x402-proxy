@@ -21,6 +21,7 @@ export type {
   X402Resource,
   X402ResourceAccess,
   X402ResourceKind,
+  X402ResourceMatch,
   X402ResourceRefreshResult,
   X402ResourceStore,
   X402ResourceValidationIssue,
@@ -28,9 +29,11 @@ export type {
 export { isHttpEndpoint, isWebSocketEndpoint } from "./types";
 export {
   ConfigurationError,
+  FacilitatorSyncError,
   LeaseTokenError,
   PriceConversionError,
   RequestBodyTooLargeError,
+  ResourceRouteSyncError,
   RouteBuildError,
   SecurityPolicyError,
   UpstreamRequestError,

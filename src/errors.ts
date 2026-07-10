@@ -7,7 +7,9 @@ export type X402ProxyErrorCode =
   | "UPSTREAM_TIMEOUT_ERROR"
   | "SECURITY_POLICY_ERROR"
   | "LEASE_TOKEN_ERROR"
-  | "REQUEST_BODY_TOO_LARGE_ERROR";
+  | "REQUEST_BODY_TOO_LARGE_ERROR"
+  | "FACILITATOR_SYNC_ERROR"
+  | "RESOURCE_ROUTE_SYNC_ERROR";
 
 export abstract class X402ProxyError extends Error {
   public readonly code: X402ProxyErrorCode;
@@ -78,5 +80,27 @@ export class LeaseTokenError extends X402ProxyError {
 export class RequestBodyTooLargeError extends X402ProxyError {
   constructor(message: string, context?: Record<string, unknown>) {
     super("RequestBodyTooLargeError", "REQUEST_BODY_TOO_LARGE_ERROR", message, context);
+  }
+}
+
+/**
+ * The facilitator /supported sync failed (unreachable facilitator, or a route whose
+ * network/scheme it does not support). Mapped to HTTP 503: the condition is
+ * retryable — the sync is re-attempted on the next payment request.
+ */
+export class FacilitatorSyncError extends X402ProxyError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super("FacilitatorSyncError", "FACILITATOR_SYNC_ERROR", message, context);
+  }
+}
+
+/**
+ * A request matched a loaded resource whose payment route is missing from the
+ * current route table — only possible in the brief window while a refresh swaps
+ * generations. Mapped to HTTP 503; the client should simply retry.
+ */
+export class ResourceRouteSyncError extends X402ProxyError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super("ResourceRouteSyncError", "RESOURCE_ROUTE_SYNC_ERROR", message, context);
   }
 }

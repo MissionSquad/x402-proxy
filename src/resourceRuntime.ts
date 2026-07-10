@@ -11,8 +11,10 @@ import type { Express, Request, RequestHandler, Response } from "express";
 
 import { resolvePrice } from "./currency";
 import {
+  FacilitatorSyncError,
   LeaseTokenError,
   RequestBodyTooLargeError,
+  ResourceRouteSyncError,
   RouteBuildError,
   SecurityPolicyError,
   UpstreamRequestError,
@@ -49,6 +51,7 @@ import type {
   X402LoadedResource,
   X402ProxyDiagnostics,
   X402Resource,
+  X402ResourceMatch,
   X402ResourceRefreshResult,
   X402ResourceStore,
   X402ResourceValidationIssue,
@@ -81,8 +84,19 @@ export type X402ResourceRuntimeOptions = {
 
 type PaymentVerifiedResult = Extract<HTTPProcessResult, { type: "payment-verified" }>;
 
+/**
+ * Outcome of the payment phase for a matched paid resource:
+ * - "verified": a valid payment was presented; the caller settles, then serves.
+ * - "granted": a protected-request hook granted access; serve WITHOUT settlement.
+ * - "responded": a response (402 challenge, payment error, 503) was already sent.
+ */
+type ProcessPaymentOutcome =
+  | { kind: "verified"; payment: PaymentVerifiedResult }
+  | { kind: "granted" }
+  | { kind: "responded" };
+
 function toPaymentPath(resource: X402Resource): string {
-  if (resource.kind === "http") {
+  if (resource.kind === "http" || resource.kind === "http-stream-direct") {
     return resource.publicPath;
   }
   if (!resource.stream) {
@@ -92,12 +106,40 @@ function toPaymentPath(resource: X402Resource): string {
 }
 
 function toPaymentMethod(resource: X402Resource): HttpMethod | "POST" {
-  return resource.kind === "http" ? resource.method : "POST";
+  return resource.kind === "http" || resource.kind === "http-stream-direct" ? resource.method : "POST";
+}
+
+/**
+ * Path under which a body-matched resource's payment route is registered. Resources
+ * with a `match` discriminator share their real publicPath, so the @x402/core route
+ * table (which is path-keyed) needs a unique synthetic key per resource. The synthetic
+ * path is only ever used as a route-table key and as `context.path` during payment
+ * processing — the 402 challenge advertises the real request URL, because @x402/core
+ * falls back to `adapter.getUrl()` when `RouteConfig.resource` is unset, and explicit
+ * discovery URLs are built from the real publicPath.
+ */
+function toSyntheticMatchPath(resource: X402Resource): string {
+  return `/__x402/match/${encodeURIComponent(resource.id)}`;
+}
+
+/**
+ * Key for the @x402/core route table AND the `context.path` used when processing a
+ * payment for this resource. Must be unique across loaded resources.
+ */
+function toPaymentRoutePath(resource: X402Resource): string {
+  return resource.match ? toSyntheticMatchPath(resource) : toPaymentPath(resource);
+}
+
+function toPaymentRouteKey(resource: X402Resource): string {
+  return `${toPaymentMethod(resource)} ${toPaymentRoutePath(resource)}`;
 }
 
 function toRouteDescription(resource: X402Resource): string {
   if (resource.kind === "http") {
     return `Paid HTTP access for ${resource.id}`;
+  }
+  if (resource.kind === "http-stream-direct") {
+    return `Paid HTTP stream for ${resource.id}`;
   }
   if (resource.kind === "http-stream") {
     return `Paid HTTP stream lease for ${resource.id}`;
@@ -150,7 +192,7 @@ function toRouteConfig(resource: X402Resource, discovery?: DiscoveryConfig): Rou
 }
 
 function toLoadedResource(resource: X402Resource): X402LoadedResource {
-  return {
+  const loaded: X402LoadedResource = {
     id: resource.id,
     kind: resource.kind,
     method: resource.method,
@@ -161,6 +203,63 @@ function toLoadedResource(resource: X402Resource): X402LoadedResource {
     createdAt: resource.createdAt,
     updatedAt: resource.updatedAt,
   };
+  if (resource.match) {
+    loaded.match = resource.match;
+  }
+  return loaded;
+}
+
+/**
+ * Shape of @x402/core's RouteConfigurationError: one entry per route whose payment
+ * option has no registered scheme or no facilitator support. Detected structurally —
+ * the class is not exported in a way that survives bundling.
+ */
+type RouteConfigurationIssue = { routePattern: string; message: string };
+
+/**
+ * Kick off the facilitator /supported sync with a detached rejection guard: without
+ * it, a sync failure before any payment request awaits the promise is an unhandled
+ * rejection (fatal under Node's default --unhandled-rejections=throw). The original
+ * promise is returned so awaiting callers still observe the failure.
+ */
+function startFacilitatorSync(server: x402HTTPResourceServer): Promise<void> {
+  const sync = server.initialize();
+  sync.catch(() => {});
+  return sync;
+}
+
+function matchesRequestBody(req: Request, match: X402ResourceMatch): boolean {
+  const body: unknown = (req as Request & { body?: unknown }).body;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return false;
+  }
+  const value = (body as Record<string, unknown>)[match.bodyField];
+  return typeof value === "string" && value === match.equals;
+}
+
+function getRouteConfigurationIssues(error: unknown): RouteConfigurationIssue[] | null {
+  if (!(error instanceof Error) || error.name !== "RouteConfigurationError") {
+    return null;
+  }
+  const value = (error as Error & { errors?: unknown }).errors;
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const issues: RouteConfigurationIssue[] = [];
+  for (const entry of value) {
+    if (
+      entry &&
+      typeof entry === "object" &&
+      typeof (entry as { routePattern?: unknown }).routePattern === "string" &&
+      typeof (entry as { message?: unknown }).message === "string"
+    ) {
+      issues.push({
+        routePattern: (entry as { routePattern: string }).routePattern,
+        message: (entry as { message: string }).message,
+      });
+    }
+  }
+  return issues.length > 0 ? issues : null;
 }
 
 function inferRequestBaseUrl(req: Request, configuredPublicBaseUrl?: string): URL {
@@ -257,6 +356,12 @@ export function sendProxyErrorResponse(res: Response, error: unknown): void {
     res.status(401).json({ error: "Invalid x402 lease token", code: error.code });
     return;
   }
+  // Retryable operational conditions: facilitator sync failure and the brief
+  // refresh-race window get 503 so clients know to simply try again.
+  if (error instanceof FacilitatorSyncError || error instanceof ResourceRouteSyncError) {
+    res.status(503).json({ error: error.message, code: error.code });
+    return;
+  }
   // Any other typed proxy error (RouteBuildError, ValidationError, PriceConversionError,
   // ConfigurationError) is an operational/config fault: 500 with a code, no stack.
   if (error instanceof X402ProxyError) {
@@ -301,7 +406,13 @@ export class X402ResourceRuntime {
 
   private httpServer: x402HTTPResourceServer | null = null;
 
+  private routes: Record<string, RouteConfig> = {};
+
   private initPromise: Promise<void> | null = null;
+
+  private needsFacilitatorSync = false;
+
+  private facilitatorSyncError: string | undefined;
 
   public constructor(options: X402ResourceRuntimeOptions) {
     this.store = options.store;
@@ -326,6 +437,7 @@ export class X402ResourceRuntime {
   private loadResources(resources: X402Resource[], refreshedAt: number): X402ResourceRefreshResult {
     const invalid: X402ResourceValidationIssue[] = [];
     const seenPaymentRoutes = new Set<string>();
+    const seenPublicClaims = new Set<string>();
     const loaded: LoadedResourceInternal[] = [];
     const routes: Record<string, RouteConfig> = {};
 
@@ -342,12 +454,19 @@ export class X402ResourceRuntime {
         if (resource.stream) {
           internal.leasePattern = parseRoutePattern(resource.stream.leasePath, { allowWildcard: false });
         }
-        const paymentRoute = `${toPaymentMethod(resource)} ${toPaymentPath(resource)}`;
-        if (seenPaymentRoutes.has(paymentRoute)) {
-          invalid.push({ resourceId: resource.id, reason: `duplicate payment route ${paymentRoute}` });
+        const paymentRoute = toPaymentRouteKey(resource);
+        // Human-readable claim on the public surface: body-matched resources may share a
+        // publicPath but must have distinct discriminator values; unmatched resources
+        // must have distinct method+path claims.
+        const publicClaim = resource.match
+          ? `${resource.method} ${resource.publicPath} [${resource.match.bodyField}=${resource.match.equals}]`
+          : `${resource.method} ${resource.publicPath}`;
+        if (seenPaymentRoutes.has(paymentRoute) || seenPublicClaims.has(publicClaim)) {
+          invalid.push({ resourceId: resource.id, reason: `duplicate payment route ${publicClaim}` });
           continue;
         }
         seenPaymentRoutes.add(paymentRoute);
+        seenPublicClaims.add(publicClaim);
         routes[paymentRoute] = toRouteConfig(resource, this.discovery);
         loaded.push(internal);
       } catch (error: unknown) {
@@ -365,19 +484,57 @@ export class X402ResourceRuntime {
     this.loaded = loaded;
     this.invalid = invalid;
     this.lastRefreshAt = refreshedAt;
-    this.httpServer = new x402HTTPResourceServer(this.resourceServer, routes);
-    if (this.paywall) {
-      // The HTTP server is recreated on every resource refresh, so the paywall
-      // provider must be re-registered each time.
-      this.httpServer.registerPaywallProvider(this.paywall);
-    }
-    this.initPromise = this.syncFacilitatorOnStart ? this.httpServer.initialize() : null;
+    this.routes = routes;
+    this.rebuildHttpServer();
 
     return {
       loaded: loaded.map((item) => toLoadedResource(item.resource)),
       invalid,
       refreshedAt,
     };
+  }
+
+  /**
+   * (Re)create the @x402/core HTTP server from the current route table and schedule a
+   * facilitator sync. Called on every refresh and after pruning unsupported routes.
+   */
+  private rebuildHttpServer(): void {
+    this.httpServer = new x402HTTPResourceServer(this.resourceServer, this.routes);
+    if (this.paywall) {
+      // The HTTP server is recreated on every rebuild, so the paywall provider must be
+      // re-registered each time.
+      this.httpServer.registerPaywallProvider(this.paywall);
+    }
+    this.facilitatorSyncError = undefined;
+    this.needsFacilitatorSync = this.syncFacilitatorOnStart;
+    this.initPromise = this.syncFacilitatorOnStart ? startFacilitatorSync(this.httpServer) : null;
+  }
+
+  /**
+   * Remove routes @x402/core reported as unsupported (no registered scheme, or the
+   * facilitator does not support the network/scheme), moving their resources to the
+   * invalid list so one misconfigured resource cannot poison the rest of the paid
+   * surface. Returns true when at least one route was pruned.
+   */
+  private pruneUnsupportedRoutes(issues: RouteConfigurationIssue[]): boolean {
+    let pruned = false;
+    for (const issue of issues) {
+      const index = this.loaded.findIndex((item) => toPaymentRouteKey(item.resource) === issue.routePattern);
+      if (index === -1) {
+        continue;
+      }
+      const removed = this.loaded.splice(index, 1)[0];
+      if (!removed) {
+        continue;
+      }
+      this.invalid.push({ resourceId: removed.resource.id, reason: issue.message });
+      delete this.routes[issue.routePattern];
+      pruned = true;
+    }
+    if (pruned) {
+      this.rebuildHttpServer();
+    }
+    return pruned;
   }
 
   public async refreshResources(): Promise<X402ResourceRefreshResult> {
@@ -407,6 +564,9 @@ export class X402ResourceRuntime {
     if (this.facilitatorUrl) {
       diagnostics.facilitatorUrl = this.facilitatorUrl;
     }
+    if (this.facilitatorSyncError !== undefined) {
+      diagnostics.facilitatorSyncError = this.facilitatorSyncError;
+    }
     return diagnostics;
   }
 
@@ -417,10 +577,45 @@ export class X402ResourceRuntime {
     await this.refreshResources();
   }
 
+  /**
+   * Await the pending facilitator sync, if any. On failure caused by unsupported
+   * routes, prune them (per-resource isolation) and retry; the loop is bounded because
+   * every prune removes at least one route. On any other failure (e.g. facilitator
+   * unreachable) the sync is cleared so the NEXT payment request retries it, the
+   * failure is surfaced in diagnostics, and the current request fails 503.
+   */
   private async ensureInitialized(): Promise<void> {
-    if (this.initPromise) {
-      await this.initPromise;
-      this.initPromise = null;
+    for (;;) {
+      if (!this.needsFacilitatorSync || !this.httpServer) {
+        return;
+      }
+      if (!this.initPromise) {
+        this.initPromise = startFacilitatorSync(this.httpServer);
+      }
+      const pending = this.initPromise;
+      try {
+        await pending;
+        // A refresh may have replaced the sync while we awaited; only settle our own.
+        if (this.initPromise === pending) {
+          this.initPromise = null;
+          this.needsFacilitatorSync = false;
+          this.facilitatorSyncError = undefined;
+        }
+        return;
+      } catch (error: unknown) {
+        if (this.initPromise === pending) {
+          this.initPromise = null;
+        }
+        const issues = getRouteConfigurationIssues(error);
+        if (issues && this.pruneUnsupportedRoutes(issues)) {
+          continue;
+        }
+        const reason = error instanceof Error ? error.message : String(error);
+        this.facilitatorSyncError = reason;
+        throw new FacilitatorSyncError("Facilitator sync failed; payments are temporarily unavailable", {
+          reason,
+        });
+      }
     }
   }
 
@@ -436,11 +631,25 @@ export class X402ResourceRuntime {
     }
   }
 
-  private async processPayment(req: Request, res: Response, resource: X402Resource): Promise<PaymentVerifiedResult | null> {
+  private async processPayment(req: Request, res: Response, resource: X402Resource): Promise<ProcessPaymentOutcome> {
     await this.ensureLoaded();
+    await this.ensureInitialized();
+    // Capture one generation AFTER the sync (which may rebuild the server via pruning).
+    // routes and httpServer are always assigned together, so this pair is internally
+    // consistent even if a refresh swaps generations mid-request.
     const httpServer = this.httpServer;
-    if (!httpServer) {
-      return null;
+    const routes = this.routes;
+    const routeKey = toPaymentRouteKey(resource);
+    if (!httpServer || !(routeKey in routes)) {
+      // The matched resource has no payment route in the current generation — either
+      // the brief refresh-race window or the resource was just pruned. Retryable.
+      sendProxyErrorResponse(
+        res,
+        new ResourceRouteSyncError("Resource routes are refreshing; retry the request", {
+          resourceId: resource.id,
+        }),
+      );
+      return { kind: "responded" };
     }
 
     const adapter = new ExpressAdapter(req);
@@ -451,7 +660,10 @@ export class X402ResourceRuntime {
       paymentHeader?: string;
     } = {
       adapter,
-      path: req.path,
+      // Body-matched resources are registered under a synthetic per-resource key (their
+      // real publicPath is shared); route matching must use that same key. The 402
+      // challenge still advertises the real request URL via adapter.getUrl().
+      path: resource.match ? toPaymentRoutePath(resource) : req.path,
       method: req.method,
     };
     const paymentHeader = adapter.getHeader("payment-signature") ?? adapter.getHeader("x-payment");
@@ -459,10 +671,11 @@ export class X402ResourceRuntime {
       context.paymentHeader = paymentHeader;
     }
 
-    await this.ensureInitialized();
     const result = await httpServer.processHTTPRequest(context, this.paywallConfig);
     if (result.type === "no-payment-required") {
-      return null;
+      // The route exists in this generation, so this is a protected-request hook
+      // granting access (e.g. a paywall session): proceed without settlement.
+      return { kind: "granted" };
     }
     if (result.type === "payment-error") {
       await this.recordEvent(
@@ -478,7 +691,7 @@ export class X402ResourceRuntime {
         }),
       );
       sendPaymentError(res, result);
-      return null;
+      return { kind: "responded" };
     }
 
     const verifiedEvent = createAccessEvent({
@@ -495,7 +708,7 @@ export class X402ResourceRuntime {
       verifiedEvent.payer = payer;
     }
     await this.recordEvent(verifiedEvent);
-    return result;
+    return { kind: "verified", payment: result };
   }
 
   private async settlePayment(
@@ -555,11 +768,22 @@ export class X402ResourceRuntime {
     return true;
   }
 
-  private findPublicResource(method: string, path: string): { resource: X402Resource; match: RouteMatch } | null {
-    const candidates = this.loaded
-      .filter((item) => item.resource.method === method.toUpperCase())
-      .map((item) => ({ ...item, routePattern: item.routePattern }));
-    const result = findBestRouteMatch(candidates, path);
+  private findPublicResource(req: Request, method: string, path: string): { resource: X402Resource; match: RouteMatch } | null {
+    const candidates = this.loaded.filter((item) => item.resource.method === method.toUpperCase());
+    // Body-discriminated resources take precedence: among those whose discriminator
+    // matches the parsed request body, pick the best path match as usual.
+    const bodyMatched = candidates.filter(
+      (item) => item.resource.match !== undefined && matchesRequestBody(req, item.resource.match),
+    );
+    const discriminated = findBestRouteMatch(bodyMatched, path);
+    if (discriminated) {
+      return { resource: discriminated.candidate.resource, match: discriminated.match };
+    }
+    // Then unconditional (path-only) resources. A path whose only claimants are
+    // body-discriminated resources with non-matching bodies falls through to the host
+    // app entirely — e.g. an unknown model on a shared OpenAI-compatible endpoint.
+    const unconditional = candidates.filter((item) => item.resource.match === undefined);
+    const result = findBestRouteMatch(unconditional, path);
     return result ? { resource: result.candidate.resource, match: result.match } : null;
   }
 
@@ -575,8 +799,8 @@ export class X402ResourceRuntime {
   }
 
   private async handleHttp(req: Request, res: Response, resource: X402Resource, match: RouteMatch): Promise<void> {
-    const payment = await this.processPayment(req, res, resource);
-    if (!payment) {
+    const outcome = await this.processPayment(req, res, resource);
+    if (outcome.kind === "responded") {
       return;
     }
     const proxyInput: Parameters<typeof proxyBufferedHttpRequest>[0] = {
@@ -595,8 +819,8 @@ export class X402ResourceRuntime {
       proxyInput.securityConfig = this.security;
     }
     const upstreamResult = await proxyBufferedHttpRequest(proxyInput);
-    if (upstreamResult.status < 400) {
-      const settled = await this.settlePayment(req, res, resource, payment);
+    if (outcome.kind === "verified" && upstreamResult.status < 400) {
+      const settled = await this.settlePayment(req, res, resource, outcome.payment);
       if (!settled) {
         return;
       }
@@ -604,15 +828,52 @@ export class X402ResourceRuntime {
     await sendBufferedProxyResponse(res, upstreamResult, resource.headers);
   }
 
+  /**
+   * Single-request paid streaming: verify, settle, then pipe the upstream response
+   * unbuffered. Settlement completes BEFORE the upstream call (pay-for-access), so the
+   * PAYMENT-RESPONSE header is set before any bytes stream. Both SSE and buffered JSON
+   * upstream responses relay through the same pipe.
+   */
+  private async handleHttpStreamDirect(req: Request, res: Response, resource: X402Resource, match: RouteMatch): Promise<void> {
+    const outcome = await this.processPayment(req, res, resource);
+    if (outcome.kind === "responded") {
+      return;
+    }
+    if (outcome.kind === "verified") {
+      const settled = await this.settlePayment(req, res, resource, outcome.payment);
+      if (!settled) {
+        return;
+      }
+    }
+    const proxyInput: Parameters<typeof proxyStreamingHttpRequest>[0] = {
+      target: {
+        id: resource.id,
+        method: resource.method,
+        upstreamUrl: resource.upstreamUrl,
+        ...(resource.headers ? { headers: resource.headers } : {}),
+        ...(resource.access ? { access: resource.access } : {}),
+      },
+      req,
+      res,
+      params: match.params,
+    };
+    if (this.security) {
+      proxyInput.securityConfig = this.security;
+    }
+    await proxyStreamingHttpRequest(proxyInput);
+  }
+
   private async handleStreamLease(req: Request, res: Response, resource: X402Resource, match: RouteMatch): Promise<void> {
-    const payment = await this.processPayment(req, res, resource);
-    if (!payment) {
+    const outcome = await this.processPayment(req, res, resource);
+    if (outcome.kind === "responded") {
       return;
     }
 
-    const settled = await this.settlePayment(req, res, resource, payment);
-    if (!settled) {
-      return;
+    if (outcome.kind === "verified") {
+      const settled = await this.settlePayment(req, res, resource, outcome.payment);
+      if (!settled) {
+        return;
+      }
     }
     const baseUrl = inferRequestBaseUrl(req, this.discovery?.publicBaseUrl);
     if (resource.kind === "websocket") {
@@ -737,7 +998,7 @@ export class X402ResourceRuntime {
           return;
         }
 
-        const publicResource = this.findPublicResource(req.method, req.path);
+        const publicResource = this.findPublicResource(req, req.method, req.path);
         if (!publicResource) {
           next();
           return;
@@ -745,6 +1006,10 @@ export class X402ResourceRuntime {
 
         if (publicResource.resource.kind === "http") {
           await this.handleHttp(req, res, publicResource.resource, publicResource.match);
+          return;
+        }
+        if (publicResource.resource.kind === "http-stream-direct") {
+          await this.handleHttpStreamDirect(req, res, publicResource.resource, publicResource.match);
           return;
         }
         if (publicResource.resource.kind === "http-stream") {
