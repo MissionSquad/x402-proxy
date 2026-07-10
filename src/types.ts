@@ -257,9 +257,19 @@ export type X402ProxySdkConfig = {
 export type X402ProxySdk = {
   routes: Record<string, RouteConfig>;
   paymentMiddleware: RequestHandler;
+  /**
+   * The resource runtime middleware on its own, for hosts that need to compose it
+   * (e.g. wrap it in a credential bypass so already-authenticated first-party traffic
+   * never sees a 402). When mounting this yourself, do NOT also call `install` — that
+   * would mount a second, unwrapped copy; use `installManagementRoutes` for the
+   * diagnostics/discovery routes instead.
+   */
+  middleware: RequestHandler;
   refreshResources: () => Promise<X402ResourceRefreshResult>;
   listLoadedResources: () => X402LoadedResource[];
   diagnostics: () => X402ProxyDiagnostics;
+  /** Mount GET /x402/diagnostics and (when discovery is enabled) the discovery routes, without the payment middleware. */
+  installManagementRoutes: (app: Express) => void;
   install: (app: Express) => void;
 };
 

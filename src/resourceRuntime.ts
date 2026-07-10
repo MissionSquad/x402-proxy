@@ -1027,11 +1027,15 @@ export class X402ResourceRuntime {
     };
   }
 
-  public install(app: Express): void {
-    app.use(this.middleware());
+  public installDiagnostics(app: Express): void {
     app.get("/x402/diagnostics", (_req, res) => {
       res.status(200).json(this.diagnostics());
     });
+  }
+
+  public install(app: Express): void {
+    app.use(this.middleware());
+    this.installDiagnostics(app);
   }
 }
 

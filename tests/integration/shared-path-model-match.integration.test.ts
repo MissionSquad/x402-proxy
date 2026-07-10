@@ -206,6 +206,61 @@ describe("shared-path body-match integration", () => {
     expect(result.invalid[0]?.reason).toContain("model=same/model");
   });
 
+  it("supports host-composed mounting: credential bypass around sdk.middleware", async () => {
+    const app = express();
+    app.use(express.json());
+    const sdk = createX402ProxySdk({
+      defaultNetwork: NETWORK,
+      defaultPayTo: "0xDefault",
+      leaseTokenSecret: "lease-token-secret-with-32-characters",
+      facilitator: { url: facilitatorServer.url },
+      syncFacilitatorOnStart: true,
+      security: { allowInsecureHttpUpstream: true, allowPrivateIpUpstreams: true },
+      resourceStore: new InMemoryX402ResourceStore([
+        resource("guarded-agent", "alice/agent-a", "0.01", "0xAAA0000000000000000000000000000000000001"),
+      ]),
+    });
+    await sdk.refreshResources();
+    // First-party credentialed traffic skips the paywall entirely; anonymous traffic
+    // flows into the payment middleware. Management routes mount separately so the
+    // middleware is never double-mounted.
+    app.use((req, res, next) => {
+      if (req.get("x-api-key")) {
+        next();
+        return;
+      }
+      sdk.middleware(req, res, next);
+    });
+    sdk.installManagementRoutes(app);
+    app.use((_req, res) => {
+      res.status(404).json({ marker: "host-app" });
+    });
+    const server = await startExpressServer(app);
+    try {
+      // Anonymous + matching model → 402 challenge from the paywall.
+      const anonymous = await fetch(`${server.url}/v1/chat/completions`, {
+        method: "POST",
+        ...chatInit("alice/agent-a", true),
+      });
+      expect(anonymous.status).toBe(402);
+
+      // Credentialed request with the SAME body bypasses the paywall entirely.
+      const credentialed = await fetch(`${server.url}/v1/chat/completions`, {
+        method: "POST",
+        ...chatInit("alice/agent-a", true, { "x-api-key": "msq-user-key" }),
+      });
+      expect(credentialed.status).toBe(404);
+      expect(await credentialed.json()).toEqual({ marker: "host-app" });
+
+      // Management routes work without install().
+      const diagnostics = await fetch(`${server.url}/x402/diagnostics`);
+      expect(diagnostics.status).toBe(200);
+      expect(((await diagnostics.json()) as { loadedResourceCount: number }).loadedResourceCount).toBe(1);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("rejects duplicate discriminator claims in the in-memory store", () => {
     expect(
       () =>

@@ -153,6 +153,16 @@ therefore the price/payTo/network. Rules:
 - The 402 challenge advertises the real request URL; the synthetic per-resource route
   key used internally never appears on the wire.
 
+When the shared path also serves first-party authenticated traffic, compose the
+middleware yourself so credentialed requests never see a 402, and mount the
+diagnostics/discovery routes separately (do not also call `install`, which would mount
+a second, unwrapped copy):
+
+```ts
+app.use((req, res, next) => (hasFirstPartyCredentials(req) ? next() : sdk.middleware(req, res, next)));
+sdk.installManagementRoutes(app);
+```
+
 ### WebSocket Lease Resource
 
 ```ts
