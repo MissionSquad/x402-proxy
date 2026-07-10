@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
 
     steps:
       - name: Checkout Repository
@@ -36,7 +37,34 @@ jobs:
       - name: Run Tests
         run: yarn test
 
+      # Skip-if-exists guards keep the workflow green when a push to main does
+      # not bump the version (the same version can never be published twice).
       - name: Publish to npm
-        run: npm publish --access public
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "@missionsquad/x402-proxy@${VERSION}" version >/dev/null 2>&1; then
+            echo "@missionsquad/x402-proxy@${VERSION} already on registry.npmjs.org — skipping"
+          else
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Re-point the generated .npmrc at GitHub Packages for the second publish.
+      - name: Setup Node.js for GitHub Packages
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@missionsquad'
+
+      - name: Publish to GitHub Packages
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "@missionsquad/x402-proxy@${VERSION}" version >/dev/null 2>&1; then
+            echo "@missionsquad/x402-proxy@${VERSION} already on npm.pkg.github.com — skipping"
+          else
+            npm publish
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
