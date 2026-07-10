@@ -245,6 +245,11 @@ describe("resourceStore", () => {
       ),
     ).toContain("match is only supported on http and http-stream-direct resources");
 
+    // A discriminator reads the JSON body; body-less methods can never match.
+    expect(
+      reasons(createResource({ method: "GET", match: { bodyField: "model", equals: "alice/agent-a" } })),
+    ).toContain("match requires a request-body method (POST, PUT, or PATCH)");
+
     expect(
       reasons(createResource({ match: { bodyField: "", equals: "alice/agent-a" } })),
     ).toContain("match.bodyField must be a non-empty string");

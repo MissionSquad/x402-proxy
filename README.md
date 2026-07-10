@@ -112,11 +112,12 @@ upstream chunks directly; the x402 settlement wrapper is not placed around the s
 ### Direct (single-request) Streaming Resource
 
 `http-stream-direct` takes payment on the request itself — the standard x402 402-retry
-flow, no lease endpoint — then settles and pipes the upstream response unbuffered. Both
-SSE and buffered JSON upstream responses relay through the same pipe, so one resource
-serves OpenAI-style `stream: true` and `stream: false` bodies alike. Settlement
-completes **before** the upstream call (pay-for-access; a failing upstream after
-settlement is not refunded).
+flow, no lease endpoint — then pipes the upstream response unbuffered. Both SSE and
+buffered JSON upstream responses relay through the same pipe, so one resource serves
+OpenAI-style `stream: true` and `stream: false` bodies alike. Settlement happens after
+the upstream **accepts** the request (status < 400) and before any body bytes relay:
+upstream outages and upstream error responses are never charged; failures after
+settlement (mid-stream) are not refunded.
 
 ```ts
 const directStream: X402Resource = {
@@ -286,8 +287,10 @@ it defaults to unlimited so large/streamed uploads are not broken by default.
   (verify → proxy → settle). For non-idempotent upstreams a settlement failure after the upstream
   side effect leaves the user un-charged for an action already performed; supply an `accessEventStore`
   to capture `settlement_failed` events for reconciliation. `http-stream-direct` requests settle
-  **before** the upstream call (verify → settle → pipe): access is sold up front and an upstream
-  failure after settlement is not refunded.
+  after the upstream response headers arrive with status < 400 and before any body bytes are
+  relayed (verify → connect → settle → pipe): upstream outages/errors are never charged, the
+  `PAYMENT-RESPONSE` header always precedes the stream, and a mid-stream failure after settlement
+  is not refunded. If settlement itself fails after connect, the upstream request is aborted.
 - **Facilitator sync failures are isolated and retryable.** A resource whose
   `(network, scheme)` the facilitator does not support is pruned to the invalid list on
   the first payment request (visible in `/x402/diagnostics`) instead of failing the

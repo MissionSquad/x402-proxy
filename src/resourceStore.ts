@@ -153,6 +153,11 @@ export function validateX402Resource(resource: X402Resource): X402ResourceValida
     if (resource.kind !== "http" && resource.kind !== "http-stream-direct") {
       errors.push("match is only supported on http and http-stream-direct resources");
     }
+    // A discriminator reads the parsed JSON request body, which only body-carrying
+    // methods have — a GET/HEAD/DELETE match resource could never match anything.
+    if (!["POST", "PUT", "PATCH"].includes(resource.method)) {
+      errors.push("match requires a request-body method (POST, PUT, or PATCH)");
+    }
     if (!isNonEmptyString(resource.match.bodyField)) {
       errors.push("match.bodyField must be a non-empty string");
     }

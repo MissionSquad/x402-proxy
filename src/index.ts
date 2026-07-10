@@ -64,6 +64,7 @@ export {
   assertUpstreamAllowed,
   createHttpProxyHandler,
   isAbortError,
+  openStreamingUpstream,
   proxyBufferedHttpRequest,
   proxyStreamingHttpRequest,
   sendBufferedProxyResponse,
@@ -71,6 +72,7 @@ export {
   type EffectiveSecurityPolicy,
   type HttpProxyResourceTarget,
   type ProxyHttpRequestInput,
+  type StreamingUpstreamConnection,
 } from "./httpProxy";
 export {
   InMemoryX402AccessEventStore,

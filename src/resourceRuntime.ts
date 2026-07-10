@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { ExpressAdapter } from "@x402/express";
 import {
   x402HTTPResourceServer,
@@ -23,6 +25,7 @@ import {
 } from "./errors";
 import {
   isAbortError,
+  openStreamingUpstream,
   proxyBufferedHttpRequest,
   proxyStreamingHttpRequest,
   sendBufferedProxyResponse,
@@ -87,12 +90,15 @@ type PaymentVerifiedResult = Extract<HTTPProcessResult, { type: "payment-verifie
 /**
  * Outcome of the payment phase for a matched paid resource:
  * - "verified": a valid payment was presented; the caller settles, then serves.
- * - "granted": a protected-request hook granted access; serve WITHOUT settlement.
  * - "responded": a response (402 challenge, payment error, 503) was already sent.
+ *
+ * There is deliberately no "granted" (serve-without-payment) outcome: this SDK never
+ * registers @x402/core `onProtectedRequest` hooks, so after the route key is confirmed
+ * present, a `no-payment-required` result can only mean a proxy↔core route-matching
+ * discrepancy — which must fail closed (503), never serve for free.
  */
 type ProcessPaymentOutcome =
   | { kind: "verified"; payment: PaymentVerifiedResult }
-  | { kind: "granted" }
   | { kind: "responded" };
 
 function toPaymentPath(resource: X402Resource): string {
@@ -117,9 +123,16 @@ function toPaymentMethod(resource: X402Resource): HttpMethod | "POST" {
  * processing — the 402 challenge advertises the real request URL, because @x402/core
  * falls back to `adapter.getUrl()` when `RouteConfig.resource` is unset, and explicit
  * discovery URLs are built from the real publicPath.
+ *
+ * The segment is a lowercase-hex digest of the resource id, NOT the id itself:
+ * @x402/core decodes incoming paths (`decodeURIComponent`, slash collapsing) but
+ * compiles route keys literally as case-insensitive patterns where `*` is a wildcard
+ * and `[x]` a parameter — so raw ids containing `/`, `%`, `*`, `[`, uppercase, etc.
+ * would fail to match their own route or cross-match other resources' routes.
+ * Lowercase hex is immune to all of those transforms.
  */
 function toSyntheticMatchPath(resource: X402Resource): string {
-  return `/__x402/match/${encodeURIComponent(resource.id)}`;
+  return `/__x402/match/${createHash("sha256").update(resource.id).digest("hex")}`;
 }
 
 /**
@@ -579,13 +592,18 @@ export class X402ResourceRuntime {
 
   /**
    * Await the pending facilitator sync, if any. On failure caused by unsupported
-   * routes, prune them (per-resource isolation) and retry; the loop is bounded because
-   * every prune removes at least one route. On any other failure (e.g. facilitator
-   * unreachable) the sync is cleared so the NEXT payment request retries it, the
-   * failure is surfaced in diagnostics, and the current request fails 503.
+   * routes, prune them (per-resource isolation) and retry; every prune strictly
+   * shrinks the route set, so pruning converges. On any other failure (e.g.
+   * facilitator unreachable) the sync is cleared so the NEXT payment request retries
+   * it, the failure is surfaced in diagnostics, and the current request fails 503.
+   *
+   * Concurrency: many requests may await the same sync. Whichever handles the failure
+   * first prunes and schedules a fresh sync; the others observe that a newer sync
+   * exists and follow it instead of failing spuriously. The iteration cap only guards
+   * against pathological refresh storms.
    */
   private async ensureInitialized(): Promise<void> {
-    for (;;) {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
       if (!this.needsFacilitatorSync || !this.httpServer) {
         return;
       }
@@ -595,12 +613,13 @@ export class X402ResourceRuntime {
       const pending = this.initPromise;
       try {
         await pending;
-        // A refresh may have replaced the sync while we awaited; only settle our own.
-        if (this.initPromise === pending) {
-          this.initPromise = null;
-          this.needsFacilitatorSync = false;
-          this.facilitatorSyncError = undefined;
+        if (this.initPromise !== pending) {
+          // A refresh replaced the sync while we awaited; re-evaluate the new generation.
+          continue;
         }
+        this.initPromise = null;
+        this.needsFacilitatorSync = false;
+        this.facilitatorSyncError = undefined;
         return;
       } catch (error: unknown) {
         if (this.initPromise === pending) {
@@ -610,6 +629,11 @@ export class X402ResourceRuntime {
         if (issues && this.pruneUnsupportedRoutes(issues)) {
           continue;
         }
+        if (this.initPromise !== null && this.initPromise !== pending) {
+          // A concurrent request already pruned/rebuilt and scheduled a fresh sync —
+          // follow it rather than reporting an error that is already being recovered.
+          continue;
+        }
         const reason = error instanceof Error ? error.message : String(error);
         this.facilitatorSyncError = reason;
         throw new FacilitatorSyncError("Facilitator sync failed; payments are temporarily unavailable", {
@@ -617,6 +641,7 @@ export class X402ResourceRuntime {
         });
       }
     }
+    throw new FacilitatorSyncError("Facilitator sync did not converge; retry the request", {});
   }
 
   /**
@@ -673,9 +698,16 @@ export class X402ResourceRuntime {
 
     const result = await httpServer.processHTTPRequest(context, this.paywallConfig);
     if (result.type === "no-payment-required") {
-      // The route exists in this generation, so this is a protected-request hook
-      // granting access (e.g. a paywall session): proceed without settlement.
-      return { kind: "granted" };
+      // The route key was confirmed present above and this SDK registers no
+      // grant-access hooks, so this can only be a proxy↔core route-matching
+      // discrepancy. Fail closed — never serve a paid resource for free.
+      sendProxyErrorResponse(
+        res,
+        new ResourceRouteSyncError("Payment route did not match; retry the request", {
+          resourceId: resource.id,
+        }),
+      );
+      return { kind: "responded" };
     }
     if (result.type === "payment-error") {
       await this.recordEvent(
@@ -819,7 +851,7 @@ export class X402ResourceRuntime {
       proxyInput.securityConfig = this.security;
     }
     const upstreamResult = await proxyBufferedHttpRequest(proxyInput);
-    if (outcome.kind === "verified" && upstreamResult.status < 400) {
+    if (upstreamResult.status < 400) {
       const settled = await this.settlePayment(req, res, resource, outcome.payment);
       if (!settled) {
         return;
@@ -829,23 +861,19 @@ export class X402ResourceRuntime {
   }
 
   /**
-   * Single-request paid streaming: verify, settle, then pipe the upstream response
-   * unbuffered. Settlement completes BEFORE the upstream call (pay-for-access), so the
-   * PAYMENT-RESPONSE header is set before any bytes stream. Both SSE and buffered JSON
-   * upstream responses relay through the same pipe.
+   * Single-request paid streaming: verify, connect upstream, settle once the upstream
+   * has ACCEPTED the request (status < 400), then pipe unbuffered. Mirrors handleHttp's
+   * settle-on-success rule: upstream outages and upstream error responses are never
+   * charged; failures after settlement (mid-stream) are not refunded. Settlement runs
+   * before any body bytes relay, so the PAYMENT-RESPONSE header always precedes the
+   * stream. Both SSE and buffered JSON upstream responses relay through the same pipe.
    */
   private async handleHttpStreamDirect(req: Request, res: Response, resource: X402Resource, match: RouteMatch): Promise<void> {
     const outcome = await this.processPayment(req, res, resource);
     if (outcome.kind === "responded") {
       return;
     }
-    if (outcome.kind === "verified") {
-      const settled = await this.settlePayment(req, res, resource, outcome.payment);
-      if (!settled) {
-        return;
-      }
-    }
-    const proxyInput: Parameters<typeof proxyStreamingHttpRequest>[0] = {
+    const proxyInput: Parameters<typeof openStreamingUpstream>[0] = {
       target: {
         id: resource.id,
         method: resource.method,
@@ -860,7 +888,21 @@ export class X402ResourceRuntime {
     if (this.security) {
       proxyInput.securityConfig = this.security;
     }
-    await proxyStreamingHttpRequest(proxyInput);
+    const connection = await openStreamingUpstream(proxyInput);
+    if (!connection) {
+      // Client disconnected during connection establishment: nothing was settled and
+      // there is no one left to answer.
+      return;
+    }
+    if (connection.response.status < 400) {
+      const settled = await this.settlePayment(req, res, resource, outcome.payment);
+      if (!settled) {
+        // 402 already sent by settlePayment; stop the upstream run.
+        connection.abort();
+        return;
+      }
+    }
+    await connection.relay();
   }
 
   private async handleStreamLease(req: Request, res: Response, resource: X402Resource, match: RouteMatch): Promise<void> {
@@ -869,11 +911,9 @@ export class X402ResourceRuntime {
       return;
     }
 
-    if (outcome.kind === "verified") {
-      const settled = await this.settlePayment(req, res, resource, outcome.payment);
-      if (!settled) {
-        return;
-      }
+    const settled = await this.settlePayment(req, res, resource, outcome.payment);
+    if (!settled) {
+      return;
     }
     const baseUrl = inferRequestBaseUrl(req, this.discovery?.publicBaseUrl);
     if (resource.kind === "websocket") {
