@@ -218,13 +218,67 @@ describe("resourceStore", () => {
     expect(runtime.diagnostics().invalidResourceCount).toBe(1);
   });
 
+  it("validates match discriminators and the http-stream-direct kind", () => {
+    const reasons = (resource: X402Resource): string[] =>
+      validateX402Resource(resource).map((issue) => issue.reason);
+
+    // Valid: body-matched direct-stream resource sharing a concrete path.
+    expect(
+      validateX402Resource(
+        createResource({
+          kind: "http-stream-direct",
+          publicPath: "/v1/chat/completions",
+          upstreamUrl: "https://upstream.example.com/v1/chat/completions",
+          match: { bodyField: "model", equals: "alice/agent-a" },
+        }),
+      ),
+    ).toEqual([]);
+
+    // match is limited to kinds that take payment on the public request itself.
+    expect(
+      reasons(
+        createResource({
+          kind: "http-stream",
+          match: { bodyField: "model", equals: "alice/agent-a" },
+          stream: { leasePath: "/lease", leaseSeconds: 60, allowRenewal: false, renewalWindowSeconds: 0 },
+        }),
+      ),
+    ).toContain("match is only supported on http and http-stream-direct resources");
+
+    // A discriminator reads the JSON body; body-less methods can never match.
+    expect(
+      reasons(createResource({ method: "GET", match: { bodyField: "model", equals: "alice/agent-a" } })),
+    ).toContain("match requires a request-body method (POST, PUT, or PATCH)");
+
+    expect(
+      reasons(createResource({ match: { bodyField: "", equals: "alice/agent-a" } })),
+    ).toContain("match.bodyField must be a non-empty string");
+    expect(reasons(createResource({ match: { bodyField: "model", equals: "" } }))).toContain(
+      "match.equals must be a non-empty string",
+    );
+
+    // Direct streams settle on the request: a lease block is a misconfiguration.
+    expect(
+      reasons(
+        createResource({
+          kind: "http-stream-direct",
+          publicPath: "/v1/chat/completions",
+          upstreamUrl: "https://upstream.example.com/v1/chat/completions",
+          stream: { leasePath: "/lease", leaseSeconds: 60, allowRenewal: false, renewalWindowSeconds: 0 },
+        }),
+      ),
+    ).toContain(
+      "stream config is not applicable to http-stream-direct resources (payment settles on the request itself; there is no lease)",
+    );
+  });
+
   it("reports a specific reason for each invalid resource field", () => {
     const reasons = (resource: X402Resource): string[] =>
       validateX402Resource(resource).map((issue) => issue.reason);
 
     expect(reasons(createResource({ id: "" }))).toContain("id must be a non-empty string");
     expect(reasons(createResource({ kind: "bogus" as X402Resource["kind"] }))).toContain(
-      "kind must be http, http-stream, or websocket",
+      "kind must be http, http-stream, http-stream-direct, or websocket",
     );
     expect(reasons(createResource({ method: "TRACE" as X402Resource["method"] }))).toContain(
       "method is not supported",

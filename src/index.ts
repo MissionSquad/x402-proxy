@@ -21,6 +21,7 @@ export type {
   X402Resource,
   X402ResourceAccess,
   X402ResourceKind,
+  X402ResourceMatch,
   X402ResourceRefreshResult,
   X402ResourceStore,
   X402ResourceValidationIssue,
@@ -28,9 +29,11 @@ export type {
 export { isHttpEndpoint, isWebSocketEndpoint } from "./types";
 export {
   ConfigurationError,
+  FacilitatorSyncError,
   LeaseTokenError,
   PriceConversionError,
   RequestBodyTooLargeError,
+  ResourceRouteSyncError,
   RouteBuildError,
   SecurityPolicyError,
   UpstreamRequestError,
@@ -61,6 +64,7 @@ export {
   assertUpstreamAllowed,
   createHttpProxyHandler,
   isAbortError,
+  openStreamingUpstream,
   proxyBufferedHttpRequest,
   proxyStreamingHttpRequest,
   sendBufferedProxyResponse,
@@ -68,6 +72,7 @@ export {
   type EffectiveSecurityPolicy,
   type HttpProxyResourceTarget,
   type ProxyHttpRequestInput,
+  type StreamingUpstreamConnection,
 } from "./httpProxy";
 export {
   InMemoryX402AccessEventStore,

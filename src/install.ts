@@ -200,16 +200,22 @@ export function createX402ProxySdk(config: X402ProxySdkConfig): X402ProxySdk {
     runtimeInput.initialResources = staticResources;
   }
   const resourceRuntime = new X402ResourceRuntime(runtimeInput);
+  const installManagementRoutes = (app: Express): void => {
+    installDiscoveryEndpoints(app, config.discovery, configuredEndpoints, resourceRuntime);
+    resourceRuntime.installDiagnostics(app);
+  };
 
   return {
     routes,
     paymentMiddleware,
+    middleware: resourceRuntime.middleware(),
     refreshResources: () => resourceRuntime.refreshResources(),
     listLoadedResources: () => resourceRuntime.listLoadedResources(),
     diagnostics: () => resourceRuntime.diagnostics(),
+    installManagementRoutes,
     install(app: Express): void {
-      installDiscoveryEndpoints(app, config.discovery, configuredEndpoints, resourceRuntime);
-      resourceRuntime.install(app);
+      installManagementRoutes(app);
+      app.use(resourceRuntime.middleware());
     },
   };
 }

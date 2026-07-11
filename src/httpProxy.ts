@@ -330,7 +330,27 @@ export async function sendBufferedProxyResponse(
   res.send(result.body);
 }
 
-export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): Promise<void> {
+/**
+ * An upstream streaming connection whose response headers have arrived but whose body
+ * has not been relayed yet. Lets callers act between connection and relay — e.g. settle
+ * an x402 payment only after the upstream accepted the request (status < 400) and
+ * before any body bytes reach the client.
+ */
+export type StreamingUpstreamConnection = {
+  response: globalThis.Response;
+  /** Write status + policy-filtered headers to the client and pipe the body with backpressure and disconnect propagation. */
+  relay: () => Promise<void>;
+  /** Cancel the upstream request without relaying (e.g. settlement failed after connect). */
+  abort: () => void;
+};
+
+/**
+ * Connect to the streaming upstream. Resolves once response headers arrive; resolves
+ * `null` when the client disconnected during connection establishment (nothing to send).
+ *
+ * @throws SecurityPolicyError / UpstreamTimeoutError / fetch errors on real failures.
+ */
+export async function openStreamingUpstream(input: ProxyHttpRequestInput): Promise<StreamingUpstreamConnection | null> {
   const security = toEffectiveSecurityPolicy(input.securityConfig);
   const targetUrl = createInterpolatedTargetUrl(
     input.target,
@@ -379,13 +399,36 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
     // A client disconnect aborts the shared controller; there is nothing left to send.
     // Swallow only the resulting abort rejection — any other failure is a real error.
     if (clientClosed && isAbortError(error)) {
-      return;
+      return null;
     }
     throw error;
   } finally {
     clearTimeout(timeout);
   }
 
+  return {
+    response,
+    abort: () => {
+      controller.abort();
+    },
+    relay: () => relayStreamingResponse(input, response, controller.signal, () => clientClosed),
+  };
+}
+
+export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): Promise<void> {
+  const connection = await openStreamingUpstream(input);
+  if (!connection) {
+    return;
+  }
+  await connection.relay();
+}
+
+async function relayStreamingResponse(
+  input: ProxyHttpRequestInput,
+  response: globalThis.Response,
+  abortSignal: AbortSignal,
+  isClientClosed: () => boolean,
+): Promise<void> {
   applyUpstreamResponseHeaders(input.res, response, input.target.headers);
   input.res.status(response.status);
 
@@ -401,26 +444,26 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
       if (done) {
         break;
       }
-      if (clientClosed) {
+      if (isClientClosed()) {
         break;
       }
       // Honor backpressure: if the client socket buffer is full, wait for it to drain
       // (or for the client to disconnect) before pulling the next upstream chunk. Also
       // wake on the abort signal so the wait can never outlive the upstream request,
       // regardless of what triggered the abort.
-      if (!input.res.write(Buffer.from(value)) && !clientClosed) {
+      if (!input.res.write(Buffer.from(value)) && !isClientClosed()) {
         await new Promise<void>((resolve) => {
           const settle = (): void => {
             input.res.off("drain", settle);
             input.res.off("close", settle);
             input.req.off("close", settle);
-            controller.signal.removeEventListener("abort", settle);
+            abortSignal.removeEventListener("abort", settle);
             resolve();
           };
           input.res.once("drain", settle);
           input.res.once("close", settle);
           input.req.once("close", settle);
-          controller.signal.addEventListener("abort", settle, { once: true });
+          abortSignal.addEventListener("abort", settle, { once: true });
         });
       }
     }
@@ -432,7 +475,7 @@ export async function proxyStreamingHttpRequest(input: ProxyHttpRequestInput): P
     // with an AbortError; there is no one left to answer, so swallow only that case.
     // Any other failure is a real relay error and must propagate even if the client
     // is gone, so it stays visible to host-level error handling.
-    if (!(clientClosed && isAbortError(error))) {
+    if (!(isClientClosed() && isAbortError(error))) {
       throw error;
     }
   } finally {

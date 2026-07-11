@@ -109,6 +109,61 @@ Clients pay `POST /paid/agents/alice/research/chat/lease`, receive a signed leas
 `POST /paid/agents/alice/research/chat?t=<lease>`. The stream path validates the lease and proxies
 upstream chunks directly; the x402 settlement wrapper is not placed around the streaming response.
 
+### Direct (single-request) Streaming Resource
+
+`http-stream-direct` takes payment on the request itself — the standard x402 402-retry
+flow, no lease endpoint — then pipes the upstream response unbuffered. Both SSE and
+buffered JSON upstream responses relay through the same pipe, so one resource serves
+OpenAI-style `stream: true` and `stream: false` bodies alike. Settlement happens after
+the upstream **accepts** the request (status < 400) and before any body bytes relay:
+upstream outages and upstream error responses are never charged; failures after
+settlement (mid-stream) are not refunded.
+
+```ts
+const directStream: X402Resource = {
+  id: "agent-a-chat",
+  enabled: true,
+  kind: "http-stream-direct",
+  method: "POST",
+  publicPath: "/v1/chat/completions",
+  match: { bodyField: "model", equals: "alice/agent-a" },
+  upstreamUrl: "https://internal.example.com/v1/chat/completions",
+  pricing: { amount: "0.02", network: "eip155:8453", payTo: "0xAlice" },
+  headers: { presets: ["streaming"], addRequestHeaders: { "content-type": "application/json" } },
+  access: { mode: "service-token", serviceTokenHeader: "x-api-key", serviceTokenValue: "..." },
+  createdAt: Date.now(),
+  updatedAt: Date.now(),
+};
+```
+
+### Body-matched resources (shared publicPath)
+
+The optional `match: { bodyField, equals }` discriminator lets many resources share one
+`publicPath`, selected by a field of the parsed JSON request body — e.g. an
+OpenAI-compatible endpoint where the `model` string picks the paid resource and
+therefore the price/payTo/network. Rules:
+
+- Allowed on `http` and `http-stream-direct` kinds (payment happens on the public
+  request, where the body is present).
+- Requires a JSON body parser (`express.json()`) mounted **before** the proxy
+  middleware; without a parsed body the resource never matches.
+- Body-matched resources take precedence over unmatched resources on the same path; a
+  request whose body matches no discriminator falls through to the host app (`next()`),
+  so unknown values keep their existing behavior (e.g. a 401/404 from your own routes).
+- Two resources may not claim the same `(method, publicPath, bodyField, equals)`.
+- The 402 challenge advertises the real request URL; the synthetic per-resource route
+  key used internally never appears on the wire.
+
+When the shared path also serves first-party authenticated traffic, compose the
+middleware yourself so credentialed requests never see a 402, and mount the
+diagnostics/discovery routes separately (do not also call `install`, which would mount
+a second, unwrapped copy):
+
+```ts
+app.use((req, res, next) => (hasFirstPartyCredentials(req) ? next() : sdk.middleware(req, res, next)));
+sdk.installManagementRoutes(app);
+```
+
 ### WebSocket Lease Resource
 
 ```ts
@@ -228,7 +283,21 @@ it defaults to unlimited so large/streamed uploads are not broken by default.
   check is a floor, not a guarantee of entropy.
 - **Audit events are best-effort.** A failing `accessEventStore.record` never changes the user-facing
   result of a paid request.
-- **Settlement ordering.** HTTP requests are settled after a successful (`< 400`) upstream response
+- **Settlement ordering.** `http` requests are settled after a successful (`< 400`) upstream response
   (verify → proxy → settle). For non-idempotent upstreams a settlement failure after the upstream
   side effect leaves the user un-charged for an action already performed; supply an `accessEventStore`
-  to capture `settlement_failed` events for reconciliation.
+  to capture `settlement_failed` events for reconciliation. `http-stream-direct` requests settle
+  after the upstream response headers arrive with status < 400 and before any body bytes are
+  relayed (verify → connect → settle → pipe): upstream outages/errors are never charged, the
+  `PAYMENT-RESPONSE` header always precedes the stream, and a mid-stream failure after settlement
+  is not refunded. If settlement itself fails after connect, the upstream request is aborted.
+- **Facilitator sync failures are isolated and retryable.** A resource whose
+  `(network, scheme)` the facilitator does not support is pruned to the invalid list on
+  the first payment request (visible in `/x402/diagnostics`) instead of failing the
+  whole paid surface. Any other sync failure (e.g. facilitator unreachable) fails
+  payment requests with `503 FACILITATOR_SYNC_ERROR`, surfaces as
+  `diagnostics().facilitatorSyncError`, and is retried on the next payment request. A
+  failed background sync never raises an unhandled promise rejection.
+- **Refresh races answer 503.** A request that matches a resource whose payment route is
+  missing from the just-swapped route generation receives `503 RESOURCE_ROUTE_SYNC_ERROR`
+  (retryable) instead of hanging.

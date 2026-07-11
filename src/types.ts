@@ -25,7 +25,23 @@ export type CurrencyInput = {
   symbol?: string;
 };
 
-export type X402ResourceKind = "http" | "http-stream" | "websocket";
+export type X402ResourceKind = "http" | "http-stream" | "http-stream-direct" | "websocket";
+
+/**
+ * Optional request-body discriminator. When present, the resource only matches a
+ * request whose parsed JSON body has `body[bodyField] === equals`, allowing many
+ * resources to share one `publicPath` (e.g. an OpenAI-compatible endpoint where
+ * the `model` field selects which paid resource — and therefore which price —
+ * applies). Requires a JSON body parser to have populated `req.body` before the
+ * proxy middleware runs; without a parsed body the resource never matches.
+ *
+ * Allowed on `http` and `http-stream-direct` resources only: lease-based kinds
+ * take payment on a dedicated lease path where the chat body is not present.
+ */
+export type X402ResourceMatch = {
+  bodyField: string;
+  equals: string;
+};
 
 export type X402AccessMode = "pass-through" | "service-token";
 
@@ -78,6 +94,7 @@ export type X402Resource = {
     asset?: string;
     decimals?: number;
   };
+  match?: X402ResourceMatch;
   headers?: X402HeaderPolicy;
   access?: X402ResourceAccess;
   stream?: {
@@ -240,9 +257,19 @@ export type X402ProxySdkConfig = {
 export type X402ProxySdk = {
   routes: Record<string, RouteConfig>;
   paymentMiddleware: RequestHandler;
+  /**
+   * The resource runtime middleware on its own, for hosts that need to compose it
+   * (e.g. wrap it in a credential bypass so already-authenticated first-party traffic
+   * never sees a 402). When mounting this yourself, do NOT also call `install` — that
+   * would mount a second, unwrapped copy; use `installManagementRoutes` for the
+   * diagnostics/discovery routes instead.
+   */
+  middleware: RequestHandler;
   refreshResources: () => Promise<X402ResourceRefreshResult>;
   listLoadedResources: () => X402LoadedResource[];
   diagnostics: () => X402ProxyDiagnostics;
+  /** Mount GET /x402/diagnostics and (when discovery is enabled) the discovery routes, without the payment middleware. */
+  installManagementRoutes: (app: Express) => void;
   install: (app: Express) => void;
 };
 
@@ -253,6 +280,7 @@ export type X402LoadedResource = {
   publicPath: string;
   paymentPath: string;
   upstreamUrl: string;
+  match?: X402ResourceMatch;
   enabled: boolean;
   createdAt: number;
   updatedAt: number;
@@ -275,6 +303,12 @@ export type X402ProxyDiagnostics = {
   invalidResources: X402ResourceValidationIssue[];
   lastRefreshAt?: number;
   facilitatorUrl?: string;
+  /**
+   * Message of the most recent facilitator sync failure. Cleared once a sync
+   * succeeds. While set, payment requests fail with 503 FACILITATOR_SYNC_ERROR
+   * and the sync is retried on each subsequent payment request.
+   */
+  facilitatorSyncError?: string;
   enabledNetworks: Network[];
   storeType: string;
 };
