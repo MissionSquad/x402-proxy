@@ -1,3 +1,4 @@
+import type { PaymentRequirements } from "@x402/core/types";
 import express, { type Request, type Response as ExpressResponse } from "express";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -134,6 +135,17 @@ describe("payment metadata forwarding integration", () => {
             forwardRequestHeaders: ["x-x402-payment-id", "x-x402-payer", "x-x402-transaction"],
           },
         }),
+        // WebSocket resource: settlement (and therefore onPaymentSettled) happens on the
+        // lease POST, before any socket exists. The upstream ws URL is only embedded in the
+        // lease token, never dialed, so no upstream route is needed.
+        resource({
+          id: "ws-agent",
+          kind: "websocket",
+          method: "GET",
+          publicPath: "/ws/feed",
+          upstreamUrl: "wss://upstream.test/feed",
+          stream: { leasePath: "/paid/feed/lease", leaseSeconds: 60, allowRenewal: false, renewalWindowSeconds: 0 },
+        }),
       ]),
     });
     await sdk.refreshResources();
@@ -197,6 +209,55 @@ describe("payment metadata forwarding integration", () => {
       payTo: accepted.payTo,
     });
     expect(event?.settledAt).toBeGreaterThan(0);
+  });
+
+  it("forwards the SERVER requirement, not a tampered x402 v1 client `accepted`, on kind http", async () => {
+    // F1 anti-spoof: an x402 v1 payment is matched by scheme+network ONLY (never
+    // deep-equal-checked against the server's accepts), so a client can echo back an
+    // `accepted` that keeps the real scheme+network but forges amount/asset/payTo. The
+    // mocked facilitator /verify returns isValid:true without inspecting the payload, so
+    // the forged payment verifies — the SDK must still source upstream metadata (and the
+    // settled event) from `payment.paymentRequirements` (the server-matched requirement).
+    resetLogs();
+    const url = `${proxyServer.url}/paid/alpha`;
+    const { paymentRequired, accepted } = await readPaymentRequirement(url, "POST");
+
+    const tampered: PaymentRequirements = {
+      ...accepted,
+      amount: "0",
+      asset: "0xATTACKERasset000000000000000000000000dEaD",
+      payTo: "0xATTACKERpayout00000000000000000000000dEaD",
+    };
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "PAYMENT-SIGNATURE": buildPaymentHeader({ ...paymentRequired, x402Version: 1 }, tampered),
+      },
+    });
+    expect(response.status).toBe(200);
+
+    const hit = upstreamHits.at(-1);
+    expect(hit?.path).toBe("/alpha");
+    const headers = hit?.headers ?? {};
+    // Server values win: the forged amount/asset/payTo never reach the upstream.
+    expect(headers["x-x402-scheme"]).toBe(accepted.scheme);
+    expect(headers["x-x402-network"]).toBe(NETWORK);
+    expect(headers["x-x402-amount"]).toBe(accepted.amount);
+    expect(headers["x-x402-amount"]).not.toBe("0");
+    expect(headers["x-x402-asset"]).toBe(accepted.asset);
+    expect(headers["x-x402-asset"]).not.toBe(tampered.asset);
+    expect(headers["x-x402-pay-to"]).toBe(accepted.payTo);
+    expect(headers["x-x402-pay-to"]).not.toBe(tampered.payTo);
+
+    // The settled-event requirements mirror the server values too, never the forgery.
+    expect(settledEvents).toHaveLength(1);
+    expect(settledEvents[0]?.requirements).toEqual({
+      scheme: accepted.scheme,
+      network: accepted.network,
+      amount: accepted.amount,
+      asset: accepted.asset,
+      payTo: accepted.payTo,
+    });
   });
 
   it("forwards trusted metadata for http-stream-direct and preserves upstream-then-settle ordering", async () => {
@@ -279,6 +340,34 @@ describe("payment metadata forwarding integration", () => {
     expect(headers["x-x402-transaction"]).toBe(SETTLE_TRANSACTION);
     // The relay must not fire a second settlement or a second event.
     expect(settledEvents).toHaveLength(1);
+  });
+
+  it("fires onPaymentSettled with kind websocket on the websocket lease path", async () => {
+    resetLogs();
+    const leaseUrl = `${proxyServer.url}/paid/feed/lease`;
+    const { accepted } = await readPaymentRequirement(leaseUrl, "POST");
+    const response = await pay(leaseUrl);
+    expect(response.status).toBe(200);
+    const lease = (await response.json()) as { wsUrl: string; leaseSeconds: number };
+    expect(lease.wsUrl).toContain("/ws/feed?t=");
+    expect(lease.leaseSeconds).toBe(60);
+
+    // Settlement happens at lease issuance, before (and without) any socket or upstream call.
+    expect(order).toEqual(["settle"]);
+    expect(settledEvents).toHaveLength(1);
+    const event = settledEvents[0];
+    expect(event?.kind).toBe("websocket");
+    expect(event?.resourceId).toBe("ws-agent");
+    expect(event?.transaction).toBe(SETTLE_TRANSACTION);
+    expect(event?.network).toBe(NETWORK);
+    expect(event?.payer).toBe(SETTLE_PAYER);
+    expect(event?.requirements).toEqual({
+      scheme: accepted.scheme,
+      network: accepted.network,
+      amount: accepted.amount,
+      asset: accepted.asset,
+      payTo: accepted.payTo,
+    });
   });
 
   it("relays leases minted without payment fields (pre-0.2.1 tokens) with no metadata headers", async () => {

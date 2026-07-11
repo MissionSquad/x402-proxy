@@ -310,4 +310,22 @@ describe("applyPaymentMetadataHeaders", () => {
     expect(headers.get("x-x402-transaction")).toBe("0xok");
     expect(headers.get("x-x402-resource-id")).toBe("agents%2Falpha%20beta");
   });
+
+  it("skips a resourceId that cannot be encoded (lone surrogate) without throwing, keeping payment-id", () => {
+    const headers = new Headers();
+    // A lone high surrogate makes encodeURIComponent throw URIError; tryEncodeResourceId
+    // swallows it so a valid paid request is never 500'd mid-proxy.
+    expect(() => applyPaymentMetadataHeaders(headers, metadata({ resourceId: "\uD800" }))).not.toThrow();
+    expect(headers.get("x-x402-resource-id")).toBeNull();
+    // payment-id is set before (and independent of) the resourceId encode, so it survives.
+    expect(headers.get("x-x402-payment-id")).toBe("11111111-2222-4333-8444-555555555555");
+  });
+
+  it("encodes a path-hostile resourceId (slash + space) so it round-trips via decodeURIComponent", () => {
+    const headers = new Headers();
+    applyPaymentMetadataHeaders(headers, metadata({ resourceId: "agents/alpha beta" }));
+    const encoded = headers.get("x-x402-resource-id");
+    expect(encoded).toBe("agents%2Falpha%20beta");
+    expect(decodeURIComponent(encoded ?? "")).toBe("agents/alpha beta");
+  });
 });

@@ -264,6 +264,21 @@ function setPaymentMetadataHeader(headers: Headers, name: string, value: string 
 }
 
 /**
+ * `encodeURIComponent` that never throws: a lone surrogate (e.g. `"\uD800"`) in the input
+ * makes the built-in throw `URIError`. Resource ids are operator-controlled but only
+ * validated as non-empty strings (and custom stores may skip validation entirely), so a
+ * mid-proxy throw here would 500 an otherwise-valid paid request. Returns null when the id
+ * cannot be encoded, so the caller omits the header rather than failing the request.
+ */
+function tryEncodeResourceId(resourceId: string): string | null {
+  try {
+    return encodeURIComponent(resourceId);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Inject the trusted `x-x402-*` payment-metadata headers on an outbound upstream
  * request. This is the single trusted injection point for these names: it writes via
  * `headers.set` directly and deliberately does NOT consult `shouldDropProxyHeader`,
@@ -271,9 +286,10 @@ function setPaymentMetadataHeader(headers: Headers, name: string, value: string 
  * client-supplied values before this runs).
  *
  * Value handling:
- * - `resourceId` is ALWAYS written `encodeURIComponent`-encoded — resource ids may
- *   contain path-hostile characters (`/`, spaces, `%`, non-ASCII, ...); upstreams must
- *   decode `x-x402-resource-id` before comparing.
+ * - `resourceId` is written `encodeURIComponent`-encoded — resource ids may contain
+ *   path-hostile characters (`/`, spaces, `%`, non-ASCII, ...); upstreams must decode
+ *   `x-x402-resource-id` before comparing. An id that cannot be encoded (lone surrogate)
+ *   is skipped rather than allowed to throw.
  * - `paymentId` is SDK-generated (`randomUUID`) and written as-is.
  * - Every other value is written raw only if it passes a conservative printable-ASCII
  *   guard; invalid values are skipped silently (a mid-proxy throw must never break a
@@ -281,7 +297,10 @@ function setPaymentMetadataHeader(headers: Headers, name: string, value: string 
  */
 export function applyPaymentMetadataHeaders(headers: Headers, metadata: X402PaymentMetadata): void {
   headers.set(PAYMENT_METADATA_HEADERS.paymentId, metadata.paymentId);
-  headers.set(PAYMENT_METADATA_HEADERS.resourceId, encodeURIComponent(metadata.resourceId));
+  const encodedResourceId = tryEncodeResourceId(metadata.resourceId);
+  if (encodedResourceId !== null) {
+    headers.set(PAYMENT_METADATA_HEADERS.resourceId, encodedResourceId);
+  }
   setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.scheme, metadata.scheme);
   setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.network, metadata.network);
   setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.amount, metadata.amount);

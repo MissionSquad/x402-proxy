@@ -352,25 +352,29 @@ function getTransaction(settleResult: unknown): string | undefined {
 
 /**
  * Build the trusted upstream payment metadata for a verified payment. Values come from
- * `paymentPayload.accepted` — the VERIFIED accepted payment requirements — never from
- * the client-controlled scheme `payload` (`getPayer` reads that; it must not feed
- * upstream headers). `payer`/`transaction` are intentionally absent here: `http` and
- * `http-stream-direct` settle after the upstream call by design.
+ * `payment.paymentRequirements` — the SERVER's own matched requirement (`matchingRequirements`
+ * in @x402/core, selected from the resource's advertised `accepts` and the object the
+ * facilitator verifies/settles against) — NOT `paymentPayload.accepted`, which is the
+ * client-submitted echo and is only deep-equal-checked for x402 v2 (v1 matches scheme+network
+ * only, leaving amount/asset/payTo attacker-controllable). Never the client scheme `payload`
+ * (`getPayer` reads that; it must not feed upstream headers). `payer`/`transaction` are
+ * intentionally absent here: `http` and `http-stream-direct` settle after the upstream call by
+ * design.
  */
 function toPaymentMetadata(
   resource: X402Resource,
   payment: PaymentVerifiedResult,
   paymentId: string,
 ): X402PaymentMetadata {
-  const accepted = payment.paymentPayload.accepted;
+  const requirements = payment.paymentRequirements;
   return {
     paymentId,
     resourceId: resource.id,
-    scheme: accepted.scheme,
-    network: accepted.network,
-    amount: accepted.amount,
-    asset: accepted.asset,
-    payTo: accepted.payTo,
+    scheme: requirements.scheme,
+    network: requirements.network,
+    amount: requirements.amount,
+    asset: requirements.asset,
+    payTo: requirements.payTo,
   };
 }
 
@@ -419,15 +423,17 @@ function toLeasePaymentInfo(
   paymentId: string,
   settleResult: ProcessSettleSuccessResponse,
 ): HttpStreamLeasePaymentInfo {
-  const accepted = payment.paymentPayload.accepted;
+  // Server-matched requirement, not the client-submitted `paymentPayload.accepted` (see
+  // toPaymentMetadata). settleResult supplies the trusted payer/transaction.
+  const requirements = payment.paymentRequirements;
   const info: HttpStreamLeasePaymentInfo = {
     paymentId,
     transaction: settleResult.transaction,
-    scheme: accepted.scheme,
-    network: accepted.network,
-    amount: accepted.amount,
-    asset: accepted.asset,
-    payTo: accepted.payTo,
+    scheme: requirements.scheme,
+    network: requirements.network,
+    amount: requirements.amount,
+    asset: requirements.asset,
+    payTo: requirements.payTo,
   };
   if (typeof settleResult.payer === "string") {
     info.payer = settleResult.payer;
@@ -926,7 +932,9 @@ export class X402ResourceRuntime {
     if (!onPaymentSettled) {
       return;
     }
-    const accepted = payment.paymentPayload.accepted;
+    // Server-matched requirement, not the client-submitted `paymentPayload.accepted`
+    // (see toPaymentMetadata) — the event reports what was actually charged.
+    const requirements = payment.paymentRequirements;
     const event: X402PaymentSettledEvent = {
       paymentId,
       resourceId: resource.id,
@@ -934,11 +942,11 @@ export class X402ResourceRuntime {
       transaction: settleResult.transaction,
       network: settleResult.network,
       requirements: {
-        scheme: accepted.scheme,
-        network: accepted.network,
-        amount: accepted.amount,
-        asset: accepted.asset,
-        payTo: accepted.payTo,
+        scheme: requirements.scheme,
+        network: requirements.network,
+        amount: requirements.amount,
+        asset: requirements.asset,
+        payTo: requirements.payTo,
       },
       settledAt: Date.now(),
     };
