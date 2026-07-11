@@ -158,6 +158,14 @@ export function validateProxySdkConfig(config: X402ProxySdkConfig): void {
     errors.push("defaultPayTo must be a non-empty string");
   }
 
+  if (config.forwardPaymentMetadata !== undefined && typeof config.forwardPaymentMetadata !== "boolean") {
+    errors.push("forwardPaymentMetadata must be a boolean when provided");
+  }
+
+  if (config.onPaymentSettled !== undefined && typeof config.onPaymentSettled !== "function") {
+    errors.push("onPaymentSettled must be a function when provided");
+  }
+
   const seenIds = new Set<string>();
   const seenHttpRoutes = new Set<string>();
   const seenLeasePaths = new Set<string>();

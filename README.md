@@ -197,9 +197,11 @@ installWebSocketGateway(adapter, connector, {
 });
 ```
 
-Payment headers, hop-by-hop headers, `host`, `content-length`, and lease tokens are never forwarded
-upstream. Dynamic route params use `[name]` segments and upstream placeholders must come from the
-matched public path.
+Client-supplied payment headers (including all `x-x402-*` names), hop-by-hop headers, `host`,
+`content-length`, and lease tokens are never forwarded upstream. The proxy itself injects trusted
+`x-x402-*` payment-metadata headers on paid upstream requests (see
+[Payment metadata forwarding](#payment-metadata-forwarding)). Dynamic route params use `[name]`
+segments and upstream placeholders must come from the matched public path.
 
 ## Header forwarding
 
@@ -253,6 +255,56 @@ Responses always forward a safe default set (`content-type`, `content-dispositio
 `headers.forwardResponseHeaders`. `content-encoding` and `content-length` are never forwarded because
 the proxy re-frames the body (`fetch` transparently decompresses upstream responses). Upstream `3xx`
 responses are relayed verbatim (`Location` included) rather than followed.
+
+## Payment metadata forwarding
+
+For every paid upstream request the proxy injects trusted `x-x402-*` headers describing the verified
+payment, so upstreams (e.g. a host API mounting this SDK in-process) can do payer/transaction-level
+accounting. Values come from the verified accepted payment requirements and the settle result — never
+from client-controlled payload fields.
+
+| Header | Value |
+| --- | --- |
+| `x-x402-payment-id` | SDK-generated UUID for this verified payment; correlates with `onPaymentSettled` |
+| `x-x402-resource-id` | Resource id, **always `encodeURIComponent`-encoded** (ids may contain `/`, spaces, `%`, ...) — decode before comparing |
+| `x-x402-scheme` | Accepted payment scheme (e.g. `exact`) |
+| `x-x402-network` | Accepted CAIP-2 network |
+| `x-x402-amount` | Accepted on-chain amount (base units) |
+| `x-x402-asset` | Accepted asset address |
+| `x-x402-pay-to` | Accepted payout address |
+| `x-x402-payer` | Settled payer address (settle result) — only when settlement precedes the upstream request |
+| `x-x402-transaction` | Settlement transaction hash — only when settlement precedes the upstream request |
+
+Per-kind availability:
+
+| Kind | Headers on the upstream request |
+| --- | --- |
+| `http` | All except `x-x402-payer`/`x-x402-transaction` (settles after the upstream accepts) — correlate via `x-x402-payment-id` + `onPaymentSettled` |
+| `http-stream-direct` | Same as `http` |
+| `http-stream` (lease relay) | Full set including `x-x402-payer` and `x-x402-transaction` (settlement happened at lease issuance; the details ride inside the signed lease token, so leases minted before 0.2.1 relay without metadata headers) |
+
+To be notified of every successful settlement — including `http`/`http-stream-direct`, whose
+`payer`/`transaction` are only known post-request — supply `onPaymentSettled`:
+
+```ts
+const sdk = createX402ProxySdk({
+  // ...
+  onPaymentSettled: async (event) => {
+    // event: { paymentId, resourceId, kind, transaction, network, payer?, requirements, settledAt }
+    await accounting.recordSettlement(event.paymentId, event.payer, event.transaction, event.requirements);
+  },
+});
+```
+
+The callback fires for all resource kinds and is fire-and-forget: a throwing or rejecting callback
+never affects the payment or the proxied response. Set `forwardPaymentMetadata: false` to disable the
+upstream headers; the `onPaymentSettled` callback fires regardless.
+
+**Security.** The nine `x-x402-*` metadata names are internal payment headers: client-supplied values
+for them are always stripped and can never reach the upstream — not even when a resource's
+`forwardRequestHeaders` explicitly lists them — so any `x-x402-*` value an upstream sees was injected
+by the proxy. Metadata values are additionally guarded (printable ASCII only, resource ids
+URI-encoded); an invalid value is skipped rather than breaking the paid request.
 
 ## Request bodies
 

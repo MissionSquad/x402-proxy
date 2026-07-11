@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { ExpressAdapter } from "@x402/express";
 import {
@@ -6,6 +6,7 @@ import {
   type HTTPProcessResult,
   type PaywallConfig,
   type PaywallProvider,
+  type ProcessSettleSuccessResponse,
   type RouteConfig,
 } from "@x402/core/server";
 import type { PaymentRequirements, PaymentPayload, Network } from "@x402/core/types";
@@ -42,6 +43,8 @@ import {
   InMemoryX402LeaseUseStore,
   issueHttpStreamLease,
   verifyHttpStreamLeaseToken,
+  type HttpStreamLeasePayload,
+  type HttpStreamLeasePaymentInfo,
   type X402LeaseUseStore,
 } from "./streamLease";
 import { issueLease } from "./wsLease";
@@ -52,6 +55,8 @@ import type {
   X402AccessEvent,
   X402AccessEventStore,
   X402LoadedResource,
+  X402PaymentMetadata,
+  X402PaymentSettledEvent,
   X402ProxyDiagnostics,
   X402Resource,
   X402ResourceMatch,
@@ -83,13 +88,19 @@ export type X402ResourceRuntimeOptions = {
   initialResources?: X402Resource[];
   paywall?: PaywallProvider;
   paywallConfig?: PaywallConfig;
+  /** Inject trusted `x-x402-*` payment-metadata headers on upstream requests. Defaults to true. */
+  forwardPaymentMetadata?: boolean;
+  /** Fire-and-forget settlement notification; errors never affect the paid request. */
+  onPaymentSettled?: (event: X402PaymentSettledEvent) => void | Promise<void>;
 };
 
 type PaymentVerifiedResult = Extract<HTTPProcessResult, { type: "payment-verified" }>;
 
 /**
  * Outcome of the payment phase for a matched paid resource:
- * - "verified": a valid payment was presented; the caller settles, then serves.
+ * - "verified": a valid payment was presented; the caller settles, then serves. Each
+ *   verified payment gets a fresh SDK-generated `paymentId` that correlates the
+ *   upstream metadata headers with the later `onPaymentSettled` event.
  * - "responded": a response (402 challenge, payment error, 503) was already sent.
  *
  * There is deliberately no "granted" (serve-without-payment) outcome: this SDK never
@@ -98,7 +109,7 @@ type PaymentVerifiedResult = Extract<HTTPProcessResult, { type: "payment-verifie
  * discrepancy — which must fail closed (503), never serve for free.
  */
 type ProcessPaymentOutcome =
-  | { kind: "verified"; payment: PaymentVerifiedResult }
+  | { kind: "verified"; payment: PaymentVerifiedResult; paymentId: string }
   | { kind: "responded" };
 
 function toPaymentPath(resource: X402Resource): string {
@@ -340,6 +351,97 @@ function getTransaction(settleResult: unknown): string | undefined {
 }
 
 /**
+ * Build the trusted upstream payment metadata for a verified payment. Values come from
+ * `payment.paymentRequirements` — the SERVER's own matched requirement (`matchingRequirements`
+ * in @x402/core, selected from the resource's advertised `accepts` and the object the
+ * facilitator verifies/settles against) — NOT `paymentPayload.accepted`, which is the
+ * client-submitted echo and is only deep-equal-checked for x402 v2 (v1 matches scheme+network
+ * only, leaving amount/asset/payTo attacker-controllable). Never the client scheme `payload`
+ * (`getPayer` reads that; it must not feed upstream headers). `payer`/`transaction` are
+ * intentionally absent here: `http` and `http-stream-direct` settle after the upstream call by
+ * design.
+ */
+function toPaymentMetadata(
+  resource: X402Resource,
+  payment: PaymentVerifiedResult,
+  paymentId: string,
+): X402PaymentMetadata {
+  const requirements = payment.paymentRequirements;
+  return {
+    paymentId,
+    resourceId: resource.id,
+    scheme: requirements.scheme,
+    network: requirements.network,
+    amount: requirements.amount,
+    asset: requirements.asset,
+    payTo: requirements.payTo,
+  };
+}
+
+/**
+ * Rebuild trusted payment metadata from an HMAC-verified lease token payload at relay
+ * time. Settlement happened at lease issuance, so this is the one path where
+ * `payer`/`transaction` can be forwarded upstream. Tokens minted before 0.2.1 carry no
+ * payment fields — return null so their relays simply omit the metadata headers.
+ */
+function leasePaymentMetadata(resource: X402Resource, payload: HttpStreamLeasePayload): X402PaymentMetadata | null {
+  if (
+    typeof payload.paymentId !== "string" ||
+    typeof payload.scheme !== "string" ||
+    typeof payload.network !== "string" ||
+    typeof payload.amount !== "string" ||
+    typeof payload.asset !== "string" ||
+    typeof payload.payTo !== "string"
+  ) {
+    return null;
+  }
+  const metadata: X402PaymentMetadata = {
+    paymentId: payload.paymentId,
+    resourceId: resource.id,
+    scheme: payload.scheme,
+    network: payload.network,
+    amount: payload.amount,
+    asset: payload.asset,
+    payTo: payload.payTo,
+  };
+  if (typeof payload.payer === "string") {
+    metadata.payer = payload.payer;
+  }
+  if (typeof payload.transaction === "string") {
+    metadata.transaction = payload.transaction;
+  }
+  return metadata;
+}
+
+/**
+ * Settled-payment details to embed in an HTTP-stream lease token, so the later relay
+ * request can forward the full trusted metadata set (including `payer`/`transaction`
+ * from the settle result).
+ */
+function toLeasePaymentInfo(
+  payment: PaymentVerifiedResult,
+  paymentId: string,
+  settleResult: ProcessSettleSuccessResponse,
+): HttpStreamLeasePaymentInfo {
+  // Server-matched requirement, not the client-submitted `paymentPayload.accepted` (see
+  // toPaymentMetadata). settleResult supplies the trusted payer/transaction.
+  const requirements = payment.paymentRequirements;
+  const info: HttpStreamLeasePaymentInfo = {
+    paymentId,
+    transaction: settleResult.transaction,
+    scheme: requirements.scheme,
+    network: requirements.network,
+    amount: requirements.amount,
+    asset: requirements.asset,
+    payTo: requirements.payTo,
+  };
+  if (typeof settleResult.payer === "string") {
+    info.payer = settleResult.payer;
+  }
+  return info;
+}
+
+/**
  * Map an error thrown during request handling to a clean JSON response. Never leaks stack
  * traces or internal error context, guards against writing to an already-committed response,
  * and gives every error a stable status + code contract.
@@ -411,6 +513,10 @@ export class X402ResourceRuntime {
 
   private readonly paywallConfig: PaywallConfig | undefined;
 
+  private readonly forwardPaymentMetadata: boolean;
+
+  private readonly onPaymentSettled: ((event: X402PaymentSettledEvent) => void | Promise<void>) | undefined;
+
   private loaded: LoadedResourceInternal[] = [];
 
   private invalid: X402ResourceValidationIssue[] = [];
@@ -442,6 +548,8 @@ export class X402ResourceRuntime {
     // freshly created HTTP server.
     this.paywall = options.paywall;
     this.paywallConfig = options.paywallConfig;
+    this.forwardPaymentMetadata = options.forwardPaymentMetadata ?? true;
+    this.onPaymentSettled = options.onPaymentSettled;
     if (options.initialResources) {
       this.loadResources(options.initialResources, Date.now());
     }
@@ -740,18 +848,25 @@ export class X402ResourceRuntime {
       verifiedEvent.payer = payer;
     }
     await this.recordEvent(verifiedEvent);
-    return { kind: "verified", payment: result };
+    return { kind: "verified", payment: result, paymentId: randomUUID() };
   }
 
+  /**
+   * Settle a verified payment. Returns the full settle success result (payer,
+   * transaction, network, ...) so callers can notify the host and enrich lease tokens;
+   * returns null on failure, in which case the 402 response has already been sent (or
+   * there was no HTTP server generation to settle against).
+   */
   private async settlePayment(
     req: Request,
     res: Response,
     resource: X402Resource,
     payment: PaymentVerifiedResult,
-  ): Promise<boolean> {
+    paymentId: string,
+  ): Promise<ProcessSettleSuccessResponse | null> {
     const httpServer = this.httpServer;
     if (!httpServer) {
-      return false;
+      return null;
     }
 
     const settleResult = await httpServer.processSettlement(
@@ -774,7 +889,7 @@ export class X402ResourceRuntime {
         }),
       );
       res.status(402).json({ error: "Settlement failed", details: settleResult.errorReason });
-      return false;
+      return null;
     }
 
     applySettlementHeaders(res, settleResult);
@@ -797,7 +912,54 @@ export class X402ResourceRuntime {
       settledEvent.transaction = transaction;
     }
     await this.recordEvent(settledEvent);
-    return true;
+    this.notifyPaymentSettled(resource, payment, paymentId, settleResult);
+    return settleResult;
+  }
+
+  /**
+   * Fire the host's `onPaymentSettled` callback for a successful settlement,
+   * fire-and-forget: like audit-store writes, a throwing or rejecting callback must
+   * never affect the user-facing result of a paid request, so both synchronous throws
+   * and rejections are swallowed.
+   */
+  private notifyPaymentSettled(
+    resource: X402Resource,
+    payment: PaymentVerifiedResult,
+    paymentId: string,
+    settleResult: ProcessSettleSuccessResponse,
+  ): void {
+    const onPaymentSettled = this.onPaymentSettled;
+    if (!onPaymentSettled) {
+      return;
+    }
+    // Server-matched requirement, not the client-submitted `paymentPayload.accepted`
+    // (see toPaymentMetadata) — the event reports what was actually charged.
+    const requirements = payment.paymentRequirements;
+    const event: X402PaymentSettledEvent = {
+      paymentId,
+      resourceId: resource.id,
+      kind: resource.kind,
+      transaction: settleResult.transaction,
+      network: settleResult.network,
+      requirements: {
+        scheme: requirements.scheme,
+        network: requirements.network,
+        amount: requirements.amount,
+        asset: requirements.asset,
+        payTo: requirements.payTo,
+      },
+      settledAt: Date.now(),
+    };
+    if (typeof settleResult.payer === "string") {
+      event.payer = settleResult.payer;
+    }
+    try {
+      Promise.resolve(onPaymentSettled(event)).catch(() => {
+        // Settlement notifications are best-effort; the payment is already settled.
+      });
+    } catch {
+      // A synchronously throwing callback is equally non-fatal.
+    }
   }
 
   private findPublicResource(req: Request, method: string, path: string): { resource: X402Resource; match: RouteMatch } | null {
@@ -850,10 +1012,13 @@ export class X402ResourceRuntime {
     if (this.security) {
       proxyInput.securityConfig = this.security;
     }
+    if (this.forwardPaymentMetadata) {
+      proxyInput.paymentMetadata = toPaymentMetadata(resource, outcome.payment, outcome.paymentId);
+    }
     const upstreamResult = await proxyBufferedHttpRequest(proxyInput);
     if (upstreamResult.status < 400) {
-      const settled = await this.settlePayment(req, res, resource, outcome.payment);
-      if (!settled) {
+      const settleResult = await this.settlePayment(req, res, resource, outcome.payment, outcome.paymentId);
+      if (!settleResult) {
         return;
       }
     }
@@ -888,6 +1053,9 @@ export class X402ResourceRuntime {
     if (this.security) {
       proxyInput.securityConfig = this.security;
     }
+    if (this.forwardPaymentMetadata) {
+      proxyInput.paymentMetadata = toPaymentMetadata(resource, outcome.payment, outcome.paymentId);
+    }
     const connection = await openStreamingUpstream(proxyInput);
     if (!connection) {
       // Client disconnected during connection establishment: nothing was settled and
@@ -895,8 +1063,8 @@ export class X402ResourceRuntime {
       return;
     }
     if (connection.response.status < 400) {
-      const settled = await this.settlePayment(req, res, resource, outcome.payment);
-      if (!settled) {
+      const settleResult = await this.settlePayment(req, res, resource, outcome.payment, outcome.paymentId);
+      if (!settleResult) {
         // 402 already sent by settlePayment; stop the upstream run.
         connection.abort();
         return;
@@ -911,8 +1079,8 @@ export class X402ResourceRuntime {
       return;
     }
 
-    const settled = await this.settlePayment(req, res, resource, outcome.payment);
-    if (!settled) {
+    const settleResult = await this.settlePayment(req, res, resource, outcome.payment, outcome.paymentId);
+    if (!settleResult) {
       return;
     }
     const baseUrl = inferRequestBaseUrl(req, this.discovery?.publicBaseUrl);
@@ -943,7 +1111,13 @@ export class X402ResourceRuntime {
       return;
     }
 
-    const lease = issueHttpStreamLease(resource, this.leaseTokenSecret, baseUrl, match.params);
+    const lease = issueHttpStreamLease(
+      resource,
+      this.leaseTokenSecret,
+      baseUrl,
+      match.params,
+      toLeasePaymentInfo(outcome.payment, outcome.paymentId, settleResult),
+    );
     await this.recordEvent(
       createAccessEvent({
         resourceId: resource.id,
@@ -1024,6 +1198,14 @@ export class X402ResourceRuntime {
     };
     if (this.security) {
       proxyInput.securityConfig = this.security;
+    }
+    if (this.forwardPaymentMetadata) {
+      // Leases minted before 0.2.1 carry no payment fields; relay them without
+      // metadata headers rather than failing.
+      const metadata = leasePaymentMetadata(resource, payload);
+      if (metadata) {
+        proxyInput.paymentMetadata = metadata;
+      }
     }
     await proxyStreamingHttpRequest(proxyInput);
   }

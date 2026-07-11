@@ -161,6 +161,20 @@ describe("validateProxySdkConfig", () => {
     }, "duplicate websocket wsPath");
   });
 
+  it("validates the payment metadata options", () => {
+    expectError((c) => {
+      (c as { forwardPaymentMetadata?: unknown }).forwardPaymentMetadata = "yes";
+    }, "forwardPaymentMetadata must be a boolean when provided");
+    expectError((c) => {
+      (c as { onPaymentSettled?: unknown }).onPaymentSettled = "not-a-function";
+    }, "onPaymentSettled must be a function when provided");
+
+    const config = createValidConfig();
+    config.forwardPaymentMetadata = false;
+    config.onPaymentSettled = () => undefined;
+    expect(() => validateProxySdkConfig(config)).not.toThrow();
+  });
+
   it("accepts a config with a resourceStore and no endpoints", () => {
     expect(() =>
       validateProxySdkConfig({

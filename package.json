@@ -1,6 +1,6 @@
 {
   "name": "@missionsquad/x402-proxy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "TypeScript SDK for x402-protected HTTP and WebSocket proxy endpoints.",
   "repository": {
     "type": "git",
