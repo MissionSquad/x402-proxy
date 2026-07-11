@@ -9,13 +9,19 @@ import {
   UpstreamRequestError,
   UpstreamTimeoutError,
 } from "./errors";
-import { applyServiceTokenAccess, applyUpstreamResponseHeaders, createForwardHeaders } from "./headerPolicy";
+import {
+  applyPaymentMetadataHeaders,
+  applyServiceTokenAccess,
+  applyUpstreamResponseHeaders,
+  createForwardHeaders,
+} from "./headerPolicy";
 import { interpolateUpstreamUrl } from "./routePattern";
 import type {
   HttpMethod,
   HttpProxyEndpointConfig,
   SecurityConfig,
   X402HeaderPolicy,
+  X402PaymentMetadata,
   X402ResourceAccess,
 } from "./types";
 
@@ -176,6 +182,12 @@ export type ProxyHttpRequestInput = {
   securityConfig?: SecurityConfig;
   params?: Record<string, string>;
   excludeQueryParams?: string[];
+  /**
+   * Trusted payment metadata to inject as `x-x402-*` headers on the upstream request
+   * (after the header policy and service-token injection, so it always wins). Client
+   * values for these names are stripped by the header policy regardless.
+   */
+  paymentMetadata?: X402PaymentMetadata;
 };
 
 export type BufferedProxyResponse = {
@@ -295,6 +307,9 @@ export async function proxyBufferedHttpRequest(input: ProxyHttpRequestInput): Pr
 
   const headers = createForwardHeaders(input.req, input.target.headers);
   applyServiceTokenAccess(headers, input.target.access);
+  if (input.paymentMetadata) {
+    applyPaymentMetadataHeaders(headers, input.paymentMetadata);
+  }
   const requestInit: RequestInit = {
     method: input.req.method,
     headers,
@@ -382,6 +397,9 @@ export async function openStreamingUpstream(input: ProxyHttpRequestInput): Promi
 
   const headers = createForwardHeaders(input.req, input.target.headers);
   applyServiceTokenAccess(headers, input.target.access);
+  if (input.paymentMetadata) {
+    applyPaymentMetadataHeaders(headers, input.paymentMetadata);
+  }
   const requestInit: RequestInit = {
     method: input.req.method,
     headers,

@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
 
-import type { X402HeaderPolicy, X402HeaderPreset, X402ResourceAccess } from "./types";
+import type { X402HeaderPolicy, X402HeaderPreset, X402PaymentMetadata, X402ResourceAccess } from "./types";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -13,13 +13,33 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
-const INTERNAL_PAYMENT_HEADERS = new Set([
+/**
+ * SDK-minted payment-metadata header names, keyed by `X402PaymentMetadata` field. All
+ * nine are registered as internal payment headers, so client-supplied values can never
+ * reach the upstream (not even via a resource's `forwardRequestHeaders` allowlist) —
+ * an upstream can therefore trust that any value it sees was injected by the proxy via
+ * `applyPaymentMetadataHeaders`.
+ */
+export const PAYMENT_METADATA_HEADERS = {
+  paymentId: "x-x402-payment-id",
+  resourceId: "x-x402-resource-id",
+  scheme: "x-x402-scheme",
+  network: "x-x402-network",
+  amount: "x-x402-amount",
+  asset: "x-x402-asset",
+  payTo: "x-x402-pay-to",
+  payer: "x-x402-payer",
+  transaction: "x-x402-transaction",
+} as const;
+
+const INTERNAL_PAYMENT_HEADERS = new Set<string>([
   "payment-signature",
   "payment-required",
   "payment-response",
   "x-payment",
   "x-payment-response",
   "x-x402-lease",
+  ...Object.values(PAYMENT_METADATA_HEADERS),
 ]);
 
 /**
@@ -224,4 +244,49 @@ export function applyServiceTokenAccess(headers: Headers, access?: X402ResourceA
     return;
   }
   headers.set(serviceTokenHeader, serviceTokenValue);
+}
+
+/**
+ * Conservative payment-metadata value guard: printable ASCII only (0x20-0x7E) with no
+ * leading/trailing whitespace and at least one visible character. Stricter than
+ * `isValidHttpHeaderValue` on purpose — metadata values come from facilitator/resource
+ * data and there is no legitimate reason for them to contain non-ASCII or padding.
+ */
+function isSafePaymentMetadataValue(value: string): boolean {
+  return /^[\x21-\x7E](?:[\x20-\x7E]*[\x21-\x7E])?$/.test(value);
+}
+
+function setPaymentMetadataHeader(headers: Headers, name: string, value: string | undefined): void {
+  if (value === undefined || !isSafePaymentMetadataValue(value)) {
+    return;
+  }
+  headers.set(name, value);
+}
+
+/**
+ * Inject the trusted `x-x402-*` payment-metadata headers on an outbound upstream
+ * request. This is the single trusted injection point for these names: it writes via
+ * `headers.set` directly and deliberately does NOT consult `shouldDropProxyHeader`,
+ * because all nine names are internal payment headers (which exist precisely to strip
+ * client-supplied values before this runs).
+ *
+ * Value handling:
+ * - `resourceId` is ALWAYS written `encodeURIComponent`-encoded — resource ids may
+ *   contain path-hostile characters (`/`, spaces, `%`, non-ASCII, ...); upstreams must
+ *   decode `x-x402-resource-id` before comparing.
+ * - `paymentId` is SDK-generated (`randomUUID`) and written as-is.
+ * - Every other value is written raw only if it passes a conservative printable-ASCII
+ *   guard; invalid values are skipped silently (a mid-proxy throw must never break a
+ *   paid request), and absent optionals (`payer`, `transaction`) are simply omitted.
+ */
+export function applyPaymentMetadataHeaders(headers: Headers, metadata: X402PaymentMetadata): void {
+  headers.set(PAYMENT_METADATA_HEADERS.paymentId, metadata.paymentId);
+  headers.set(PAYMENT_METADATA_HEADERS.resourceId, encodeURIComponent(metadata.resourceId));
+  setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.scheme, metadata.scheme);
+  setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.network, metadata.network);
+  setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.amount, metadata.amount);
+  setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.asset, metadata.asset);
+  setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.payTo, metadata.payTo);
+  setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.payer, metadata.payer);
+  setPaymentMetadataHeader(headers, PAYMENT_METADATA_HEADERS.transaction, metadata.transaction);
 }

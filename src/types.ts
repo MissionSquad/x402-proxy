@@ -125,6 +125,51 @@ export type X402AccessEvent = {
   createdAt: number;
 };
 
+/**
+ * Trusted, SDK-minted payment metadata injected as `x-x402-*` request headers on the
+ * upstream call (see `applyPaymentMetadataHeaders`). Values come from the VERIFIED
+ * accepted payment requirements and the SDK itself — never from client-controlled
+ * scheme payload fields. `payer`/`transaction` are present only when settlement
+ * completed before the upstream request (the `http-stream` lease relay); `http` and
+ * `http-stream-direct` settle after the upstream accepts, so those kinds correlate
+ * settlement via `paymentId` and the `onPaymentSettled` event instead.
+ */
+export type X402PaymentMetadata = {
+  paymentId: string;
+  resourceId: string;
+  scheme: string;
+  network: string;
+  amount: string;
+  asset: string;
+  payTo: string;
+  payer?: string;
+  transaction?: string;
+};
+
+/**
+ * Host notification emitted after every successful settlement, for all resource kinds.
+ * Delivery is fire-and-forget: a throwing or rejecting callback never affects the paid
+ * request. Correlate with the upstream request via `paymentId` (`x-x402-payment-id`).
+ * `transaction`/`network`/`payer` come from the facilitator settle result;
+ * `requirements` echoes the verified accepted payment requirements.
+ */
+export type X402PaymentSettledEvent = {
+  paymentId: string;
+  resourceId: string;
+  kind: X402Resource["kind"];
+  transaction: string;
+  network: string;
+  payer?: string;
+  requirements: {
+    scheme: string;
+    network: string;
+    amount: string;
+    asset: string;
+    payTo: string;
+  };
+  settledAt: number;
+};
+
 export interface X402ResourceStore {
   listEnabledResources(): Promise<X402Resource[]>;
   getResourceById(id: string): Promise<X402Resource | null>;
@@ -235,6 +280,20 @@ export type X402ProxySdkConfig = {
   discovery?: DiscoveryConfig;
   security?: SecurityConfig;
   syncFacilitatorOnStart?: boolean;
+  /**
+   * Inject trusted `x-x402-*` payment-metadata headers on upstream requests for paid
+   * traffic (default true). Controls the upstream headers only — `onPaymentSettled`
+   * fires regardless of this flag. Client-supplied `x-x402-*` headers are always
+   * stripped whether this is enabled or not.
+   */
+  forwardPaymentMetadata?: boolean;
+  /**
+   * Called after every successful settlement (all resource kinds), fire-and-forget:
+   * rejections and thrown errors are swallowed and never affect the payment or the
+   * proxied response. Use it for payer/transaction-level accounting, correlating with
+   * the upstream request via `event.paymentId` (`x-x402-payment-id`).
+   */
+  onPaymentSettled?: (event: X402PaymentSettledEvent) => void | Promise<void>;
   /**
    * Optional paywall provider that renders the full wallet-connect payment UI for
    * browser requests hitting protected endpoints (e.g. from @x402/paywall:

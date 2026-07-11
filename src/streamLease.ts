@@ -3,6 +3,24 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { LeaseTokenError } from "./errors";
 import type { HttpMethod, X402Resource } from "./types";
 
+/**
+ * Optional settled-payment details embedded in a lease token at issuance (0.2.1+), so
+ * the later relay request can forward trusted payment metadata — including
+ * `payer`/`transaction`, which are known here because lease issuance settles before
+ * the stream request happens. Tokens minted by older versions simply lack these
+ * fields; verification and relay treat them as absent.
+ */
+export type HttpStreamLeasePaymentInfo = {
+  paymentId?: string;
+  payer?: string;
+  transaction?: string;
+  scheme?: string;
+  network?: string;
+  amount?: string;
+  asset?: string;
+  payTo?: string;
+};
+
 export type HttpStreamLeasePayload = {
   resourceId: string;
   exp: number;
@@ -10,7 +28,7 @@ export type HttpStreamLeasePayload = {
   method: HttpMethod;
   publicPath: string;
   upstreamUrl: string;
-};
+} & HttpStreamLeasePaymentInfo;
 
 export type HttpStreamLeaseIssueResult = {
   token: string;
@@ -110,6 +128,7 @@ export function issueHttpStreamLease(
   secret: string,
   requestBaseUrl: URL,
   params: Record<string, string>,
+  payment?: HttpStreamLeasePaymentInfo,
 ): HttpStreamLeaseIssueResult {
   if (!resource.stream) {
     throw new LeaseTokenError("Stream resource is missing lease config", { resourceId: resource.id });
@@ -118,6 +137,7 @@ export function issueHttpStreamLease(
   const exp = now + resource.stream.leaseSeconds;
   const token = createHttpStreamLeaseToken(
     {
+      ...payment,
       resourceId: resource.id,
       exp,
       jti: randomUUID(),

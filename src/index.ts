@@ -15,6 +15,8 @@ export type {
   X402HeaderPolicy,
   X402HeaderPreset,
   X402LoadedResource,
+  X402PaymentMetadata,
+  X402PaymentSettledEvent,
   X402ProxyDiagnostics,
   X402ProxySdk,
   X402ProxySdkConfig,
@@ -53,11 +55,13 @@ export {
   webSocketGatewayEndpointsFromResources,
 } from "./wsGateway";
 export {
+  applyPaymentMetadataHeaders,
   applyServiceTokenAccess,
   applyUpstreamResponseHeaders,
   createForwardHeaders,
   isValidHttpHeaderName,
   isValidHttpHeaderValue,
+  PAYMENT_METADATA_HEADERS,
   shouldDropProxyHeader,
 } from "./headerPolicy";
 export {
@@ -99,6 +103,7 @@ export {
   verifyHttpStreamLeaseToken,
   type HttpStreamLeaseIssueResult,
   type HttpStreamLeasePayload,
+  type HttpStreamLeasePaymentInfo,
   type X402LeaseUseStore,
 } from "./streamLease";
 export { X402ResourceRuntime, endpointToResource } from "./resourceRuntime";

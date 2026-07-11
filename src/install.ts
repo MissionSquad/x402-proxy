@@ -176,10 +176,14 @@ export function createX402ProxySdk(config: X402ProxySdkConfig): X402ProxySdk {
     leaseTokenSecret: config.leaseTokenSecret,
     syncFacilitatorOnStart: config.syncFacilitatorOnStart ?? true,
     requireProtectedResources: config.requireProtectedResources ?? true,
+    forwardPaymentMetadata: config.forwardPaymentMetadata ?? true,
     paywallConfig,
   };
   if (config.paywall) {
     runtimeInput.paywall = config.paywall;
+  }
+  if (config.onPaymentSettled) {
+    runtimeInput.onPaymentSettled = config.onPaymentSettled;
   }
   if (config.security) {
     runtimeInput.security = config.security;

@@ -56,7 +56,12 @@ export function createFacilitatorApp(controls: FacilitatorControls): Express {
       res.json({ success: false, errorReason: "insufficient_funds" });
       return;
     }
-    res.json({ success: true, transaction: "0xsettled", network });
+    res.json({
+      success: true,
+      transaction: "0xsettled",
+      network,
+      payer: "0xPayerAddress00000000000000000000000000001",
+    });
   });
   return app;
 }

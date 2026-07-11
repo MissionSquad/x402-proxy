@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  applyPaymentMetadataHeaders,
   applyServiceTokenAccess,
   applyUpstreamResponseHeaders,
   createForwardHeaders,
+  PAYMENT_METADATA_HEADERS,
   shouldDropProxyHeader,
 } from "../../src/headerPolicy";
+import type { X402PaymentMetadata } from "../../src/types";
 import { FakeResponse } from "../helpers/fakeHttp";
 
 describe("headerPolicy", () => {
@@ -200,5 +203,111 @@ describe("applyUpstreamResponseHeaders", () => {
     expect(res.headers["x-run-id"]).toBe("run-1");
     expect(res.headers["x-extra"]).toBe("v");
     expect(res.headers["x-payment"]).toBeUndefined();
+  });
+});
+
+describe("applyPaymentMetadataHeaders", () => {
+  function metadata(overrides: Partial<X402PaymentMetadata> = {}): X402PaymentMetadata {
+    return {
+      paymentId: "11111111-2222-4333-8444-555555555555",
+      resourceId: "agents/alpha beta",
+      scheme: "exact",
+      network: "eip155:8453",
+      amount: "10000",
+      asset: "0xAsset0000000000000000000000000000000001",
+      payTo: "0xPayee0000000000000000000000000000000001",
+      ...overrides,
+    };
+  }
+
+  it("registers all nine metadata names as internal payment headers", () => {
+    const names = Object.values(PAYMENT_METADATA_HEADERS);
+    expect(names).toHaveLength(9);
+    expect(new Set(names)).toEqual(
+      new Set([
+        "x-x402-payment-id",
+        "x-x402-resource-id",
+        "x-x402-scheme",
+        "x-x402-network",
+        "x-x402-amount",
+        "x-x402-asset",
+        "x-x402-pay-to",
+        "x-x402-payer",
+        "x-x402-transaction",
+      ]),
+    );
+    for (const name of names) {
+      expect(shouldDropProxyHeader(name)).toBe(true);
+    }
+  });
+
+  it("strips client-supplied metadata names even when explicitly allow-listed", () => {
+    const req = {
+      headers: {
+        "x-x402-payment-id": "spoofed-id",
+        "x-x402-payer": "0xEvil",
+        "x-x402-transaction": "0xFake",
+        accept: "*/*",
+      },
+    };
+    const headers = createForwardHeaders(req as unknown as Parameters<typeof createForwardHeaders>[0], {
+      forwardRequestHeaders: ["x-x402-payment-id", "x-x402-payer", "x-x402-transaction", "accept"],
+    });
+    expect(headers.get("x-x402-payment-id")).toBeNull();
+    expect(headers.get("x-x402-payer")).toBeNull();
+    expect(headers.get("x-x402-transaction")).toBeNull();
+    expect(headers.get("accept")).toBe("*/*");
+  });
+
+  it("writes all present fields, encoding resourceId", () => {
+    const headers = new Headers();
+    applyPaymentMetadataHeaders(
+      headers,
+      metadata({ payer: "0xPayer0000000000000000000000000000000001", transaction: "0xsettled" }),
+    );
+    expect(headers.get("x-x402-payment-id")).toBe("11111111-2222-4333-8444-555555555555");
+    expect(headers.get("x-x402-resource-id")).toBe("agents%2Falpha%20beta");
+    expect(headers.get("x-x402-scheme")).toBe("exact");
+    expect(headers.get("x-x402-network")).toBe("eip155:8453");
+    expect(headers.get("x-x402-amount")).toBe("10000");
+    expect(headers.get("x-x402-asset")).toBe("0xAsset0000000000000000000000000000000001");
+    expect(headers.get("x-x402-pay-to")).toBe("0xPayee0000000000000000000000000000000001");
+    expect(headers.get("x-x402-payer")).toBe("0xPayer0000000000000000000000000000000001");
+    expect(headers.get("x-x402-transaction")).toBe("0xsettled");
+  });
+
+  it("omits absent optionals (payer/transaction)", () => {
+    const headers = new Headers();
+    applyPaymentMetadataHeaders(headers, metadata());
+    expect(headers.get("x-x402-payment-id")).not.toBeNull();
+    expect(headers.get("x-x402-payer")).toBeNull();
+    expect(headers.get("x-x402-transaction")).toBeNull();
+  });
+
+  it("silently skips unsafe values (control chars, padding, empty, non-ASCII) without throwing", () => {
+    const headers = new Headers();
+    expect(() =>
+      applyPaymentMetadataHeaders(
+        headers,
+        metadata({
+          scheme: "bad\r\nx-injected: 1",
+          network: " padded ",
+          asset: `evil${String.fromCharCode(1)}`,
+          payTo: "",
+          payer: "payé",
+          transaction: "0xok",
+        }),
+      ),
+    ).not.toThrow();
+    expect(headers.get("x-x402-scheme")).toBeNull();
+    expect(headers.get("x-x402-network")).toBeNull();
+    expect(headers.get("x-x402-asset")).toBeNull();
+    expect(headers.get("x-x402-pay-to")).toBeNull();
+    expect(headers.get("x-x402-payer")).toBeNull();
+    expect(headers.get("x-injected")).toBeNull();
+    // Safe values on the same call still land.
+    expect(headers.get("x-x402-amount")).toBe("10000");
+    expect(headers.get("x-x402-transaction")).toBe("0xok");
+    expect(headers.get("x-x402-resource-id")).toBe("agents%2Falpha%20beta");
   });
 });
